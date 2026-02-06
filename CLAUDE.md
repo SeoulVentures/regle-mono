@@ -1,0 +1,1 @@
+- standard_review_target은 캐시가 아니라 형상 관리 데이터베이스임.

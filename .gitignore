@@ -1,0 +1,36 @@
+# IDE and Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+/temp/
+
+# Local configuration
+.env.local
+.env.*.local
+
+# Memory and cache
+memory-bank/
+.serena/cache/
+
+# Build artifacts
+*.json
+!package.json
+!composer.json
+!tsconfig.json

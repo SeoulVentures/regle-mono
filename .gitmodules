@@ -1,0 +1,24 @@
+[submodule "SeoulVenturesGroupware"]
+	path = SeoulVenturesGroupware
+	url = https://github.com/SeoulVentures/SeoulVenturesGroupware.git
+[submodule "regle-co-kr"]
+	path = regle-co-kr
+	url = https://github.com/SeoulVentures/regle-co-kr.git
+[submodule "regle-mcp-server"]
+	path = regle-mcp-server
+	url = https://github.com/SeoulVentures/regle-mcp-server.git
+[submodule "regle-universe"]
+	path = regle-universe
+	url = https://github.com/SeoulVentures/regle-universe.git
+[submodule "review-moai-refactoring"]
+	path = review-moai-refactoring
+	url = https://github.com/SeoulVentures/review-moai-refactoring.git
+[submodule "specto-admin"]
+	path = specto-admin
+	url = https://github.com/SeoulVentures/specto-admin.git
+[submodule "sv-nova-master"]
+	path = sv-nova-master
+	url = https://github.com/SeoulVentures/sv-nova-master.git
+[submodule "tm-regle.kr"]
+	path = tm-regle.kr
+	url = https://github.com/SeoulVentures/tm-regle.kr.git

@@ -149,6 +149,10 @@ rm -rf .git/modules/<path>
 - 각 리포지토리에 대한 접근 권한이 필요합니다
 - GitHub 인증 정보가 올바르게 설정되어 있어야 합니다
 
+## 📝 변경 이력
+
+변경 이력은 [CHANGELOG.md](CHANGELOG.md)를 참조하세요.
+
 ## 📚 참고 자료
 
 - [Git Submodules 공식 문서](https://git-scm.com/book/en/v2/Git-Tools-Submodules)

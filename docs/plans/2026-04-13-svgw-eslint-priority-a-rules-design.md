@@ -105,10 +105,10 @@ const TRIM_RE = /^[\s\p{White_Space}]+|[\s\p{White_Space}]+$/gu
 const TRIM_RE = /^\s+|\s+$/g
 ```
 
-**백엔드 동치성 확인 필수**: `App\Support\Review\ClientNameComparator.php` 의 trim regex 가 어느 표기를 사용하는지 조회.
-- PHP 의 `\s` 는 기본적으로 ASCII 만 (공간 4종) → NBSP(U+00A0), 전각 공백(U+3000) 불포함. 이 경우 JS 와 **비동치**.
-- PHP 에서 `\p{Zs}` 또는 `\p{White_Space}` + `u` 플래그를 쓰면 거의 JS `\s` 와 근접하나 U+FEFF 차이 잔존 가능.
-- 동치성 리스크가 확인되면 (a) 양쪽 `\p{White_Space}\uFEFF` 로 명시 통일 (b) 또는 차이점을 스펙에 문서화하고 프로덕션 영향 없음을 확인. 본 PR 은 프론트엔드 수정만, 백엔드 통일은 별도 PR.
+**백엔드 동치성 — 사전 확인 결과**: `App\Support\Review\ClientNameComparator.php` 는 `preg_replace('/^[\s\p{Z}]+|[\s\p{Z}]+$/u', ...)` 사용. `\p{Z}` = `Zs` + `Zl` + `Zp` (공간 + 라인 분리자 + 문단 분리자).
+- JS `\s` (ES spec) vs PHP `[\s\p{Z}]` 는 매칭 범위가 다름. 예: PHP 는 `Zl`/`Zp` 카테고리 특수문자 (U+2028/U+2029) 를 추가 매칭.
+- JS `\s` 도 ES spec 상 U+2028/U+2029 를 `<LS>`/`<PS>` (LineTerminator) 로 포함하므로 실제 교집합은 거의 일치 — 다만 U+FEFF 는 JS `\s` 에만, U+0085 (NEL) 은 PHP `\p{Z}` 에는 없음. 실유입 가능성 희박.
+- 양쪽 통일은 본 PR 범위 외 → 별도 PR (구현 단계에서 이슈 발행 후 역참조).
 
 ### 4.3 `formatters.ts` — kFormatter
 
@@ -279,7 +279,7 @@ setup(_, { slots }) {
 | 리스크 | 대응 |
 | --- | --- |
 | email regex 교체 시 IP literal (`user@[192.168.1.1]`) 거부로 기존 가입자 영향 | DB 조회 (`SELECT COUNT(*) FROM users WHERE email REGEXP '@\\\\['`) 결과 0 확인 전제. 구현 단계에서 실제 쿼리 수행 후 PR 본문에 결과 명시. N>0 이면 기존 regex 유지 + eslint-disable 로 전략 변경 |
-| `clientNameComparator` 의 `\s` 와 백엔드 PHP `\s` 차이 (PHP `\s` 는 ASCII 만) | 백엔드 regex 확인. 비동치 시 양쪽 통일은 별도 PR 로 분리 (본 PR 은 프론트엔드만) |
+| `clientNameComparator` 의 JS `\s` 와 백엔드 `[\s\p{Z}]` 비동치 (사전 확인됨) | 매칭 교집합 큼. U+FEFF/U+0085 미세 차이만 존재, 실유입 가능성 희박. 양쪽 통일은 별도 PR (구현 단계에서 이슈 발행) |
 | 신규 email regex 가 `sonarjs/slow-regex` 에 재차 flag 될 가능성 | 구현 착수 전 PoC (임시 파일 + `bun run lint`) 필수. flag 시 HTML5 spec 링크 주석 + `eslint-disable-next-line` 또는 `/^[^\s@]+@[^\s@]+\.[^\s@]+$/` 단순 regex 대체 |
 | `kFormatter` 부호 탈락 (`-500 → "500"`) | 기존 구현의 사전 존재 동작. 본 PR 은 의도적으로 동작 보존 (수정은 별도 이슈) |
 | `clientNameComparator` 의 `\s` 는 U+0085 (NEL) 제외 — `\p{White_Space}` 에 있던 것 | 실유입 가능성 희박. 회귀 허용. 필요 시 `[\s\u0085]` 로 확장 |

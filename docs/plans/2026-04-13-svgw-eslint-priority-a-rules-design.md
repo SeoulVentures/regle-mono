@@ -68,7 +68,7 @@ export const passwordValidator = (password: string) => {
 const EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/
 ```
 
-**구현 착수 전 PoC 필수**: 위 regex 를 임시 파일에 넣고 `bun run lint` 통과 확인. 만약 `sonarjs/slow-regex` 가 여전히 잡으면:
+**구현 착수 전 PoC 필수**: 위 regex 를 임시 파일에 넣고 `bun run lint` 통과 확인. **PoC 결과는 구현 PR 본문에 명시 후 착수**. 만약 `sonarjs/slow-regex` 가 여전히 잡으면:
 - (a) 동일 구조의 공식 HTML5 regex 이므로 eslint-disable-next-line 으로 억제 (주석에 HTML5 spec 링크)
 - (b) 또는 전체 email 검증을 브라우저 `input[type=email]` 검사 + 간단한 `@` 포함·길이 체크로 교체 (예: `/^[^\s@]+@[^\s@]+\.[^\s@]+$/`)
 
@@ -96,10 +96,12 @@ const TRIM_RE = /^[\s\p{White_Space}]+|[\s\p{White_Space}]+$/gu
 
 **After**:
 ```ts
-// JS `\s` 는 ES2015+ 에서 Unicode whitespace 전체 + BOM(U+FEFF) 포함.
-// `\p{White_Space}` 는 Unicode property 기반이지만 U+FEFF (ZWNBSP) 를 format char 로 분류해 제외함.
-// 따라서 기존의 `\s|\p{White_Space}` 중 후자는 중복 (subset) — 제거해도 매칭 범위 손실 없음.
+// JS `\s` (ECMA-262 21.2.2.12) 는 Unicode whitespace + BOM(U+FEFF) 포함.
+// `\p{White_Space}` 는 Unicode property 기반이지만 U+FEFF (ZWNBSP) 를 format char(Cf)로 분류해 제외함.
+// 따라서 기존의 `\s|\p{White_Space}` 에서 `\p{White_Space}` 는 거의 subset (후술 차이 제외).
 // Excel 업로드에서 유입 가능한 UTF-8 BOM 까지 trim 하려면 `\s` 가 필수.
+// 미세 차이: U+0085 (NEL) 은 `\p{White_Space}` 에 포함되지만 JS `\s` 에는 제외됨.
+// NEL 은 EBCDIC 잔재로 한국어 클라이언트 데이터에서 실유입 가능성 희박 — 본 PR 에서 회귀 허용.
 const TRIM_RE = /^\s+|\s+$/g
 ```
 
@@ -165,7 +167,19 @@ set(value: boolean) {
 getComputedStyle(element).height
 ```
 
-**After** — `defineComponent({ setup() {...} })` 내부 helper (파일은 `<script setup>` 이 아닌 legacy `<script lang="ts">` + setup 함수):
+**After** — `defineComponent({ setup() {...} })` 내부 helper.
+
+실파일 구조 (`TransitionExpand.vue:3-8`) 확인:
+```vue
+<script lang="ts">
+import { Transition } from 'vue'
+
+export default defineComponent({
+  name: 'TransitionExpand',
+  setup(_, { slots }) {
+    const onEnter = (element: HTMLElement) => { ... }
+```
+`<script setup>` 이 아니라 `defineComponent({setup})` 패턴이므로 헬퍼를 `setup` 내부 최상단에 둠:
 ```ts
 setup(_, { slots }) {
   // 브라우저에 강제 layout recalc 트리거 — getComputedStyle 은 live 객체라 프로퍼티 접근만으로 flush 됨.
@@ -226,7 +240,8 @@ setup(_, { slots }) {
      - 미세 차이 (기존 대비): `"Aa1!\nA\naa"` 는 개행 포함 → 기존 `.{8,}` 거부 / 신규 `length >= 8` 허용 (현실 영향 없음, 문서화)
    - `kFormatter`:
      - `1234 → "1,234"`, `9999 → "9,999"`, `10000 → "10k"`, `12345 → "12.3k"`, `-12345 → "-12.3k"`, `0 → "0"`, `999 → "999"`
-     - 반올림 경계: `1234.4 → "1,234"`, `1234.5 → "1,235"`, `1234.7 → "1,235"`, `9999.5 → "10,000"` (→ 9999 넘음으로 `"10k"` 분기?) 주의
+     - 반올림 경계: `1234.4 → "1,234"`, `1234.5 → "1,235"`, `1234.7 → "1,235"`
+     - k 분기 경계: `9999.4 → "9,999"` (abs 9999 이하, round 분기), `9999.5 → "10k"` (abs > 9999, k 분기 진입), `10000 → "10k"`
      - 음수 부호 탈락 (기존 동작 유지): `-500 → "500"` (9999 이하 음수)
      - 특수값: `kFormatter(NaN) → "NaN"`, `kFormatter(Infinity) → "Infinityk"` (기존 동작 동일)
    - `normalizeClientName` / `clientNameEquals`:
@@ -259,7 +274,8 @@ setup(_, { slots }) {
 | email regex 교체 시 IP literal (`user@[192.168.1.1]`) 거부로 기존 가입자 영향 | DB 조회 (`SELECT COUNT(*) FROM users WHERE email LIKE '%@[%]%'`) 결과 0 확인 전제. 구현 단계에서 실제 쿼리 수행 후 스펙에 결과 명시. N>0 이면 기존 regex 유지 + eslint-disable 로 전략 변경 |
 | `clientNameComparator` 의 `\s` 와 백엔드 PHP `\s` 차이 (PHP `\s` 는 ASCII 만) | 백엔드 regex 확인. 비동치 시 양쪽 통일은 별도 PR 로 분리 (본 PR 은 프론트엔드만) |
 | 신규 email regex 가 `sonarjs/slow-regex` 에 재차 flag 될 가능성 | 구현 착수 전 PoC (임시 파일 + `bun run lint`) 필수. flag 시 HTML5 spec 링크 주석 + `eslint-disable-next-line` 또는 `/^[^\s@]+@[^\s@]+\.[^\s@]+$/` 단순 regex 대체 |
-| `kFormatter` 부호 탈락 (`-500 → "500"`) | 기존 버그이지만 본 PR 범위 아님. 의도적 동작 유지. 수정은 별도 이슈 |
+| `kFormatter` 부호 탈락 (`-500 → "500"`) | 기존 구현의 사전 존재 동작. 본 PR 은 의도적으로 동작 보존 (수정은 별도 이슈) |
+| `clientNameComparator` 의 `\s` 는 U+0085 (NEL) 제외 — `\p{White_Space}` 에 있던 것 | 실유입 가능성 희박. 회귀 허용. 필요 시 `[\s\u0085]` 로 확장 |
 | password 개행 포함 허용 차이 | lookahead → length 분해로 `.{8,}` 의 non-newline 제약 사라짐. 현실 영향 없음, test case 에 명시 |
 | `kFormatter` 의 `toLocaleString('en-US')` 는 Intl 의존 | 모든 타깃 브라우저 지원 (IE11 제외, 대상 아님) |
 | 테스트 인프라 부재로 회귀 탐지 불가 | 수동 검증 테이블 + 리뷰어 재현 1-liner. 테스트 러너 도입은 별도 이슈 |
@@ -271,7 +287,7 @@ setup(_, { slots }) {
 - `sonarjs/void-use` — off 유지 (forceRepaint 패턴이 void 의존 제거)
 - `.eslintrc` / lint 스크립트 구조 변경 — 본 스코프 외
 - 백엔드 `App\Support\Review\ClientNameComparator.php` 수정 — 비동치 확인 시 별도 PR
-- `kFormatter` 의 음수 부호 탈락 버그 — 기존 동작 유지, 별도 이슈
+- `kFormatter` 의 음수 부호 탈락 — 기존 구현 동작 유지, 별도 이슈
 
 ## 9. 롤백
 

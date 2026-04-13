@@ -293,8 +293,8 @@ setup(_, { slots }) {
 - 테스트 러너 도입 (vitest 등) — 별도 이슈
 - `sonarjs/void-use` — off 유지 (참고: forceRepaint 헬퍼 도입으로 void 의존이 제거되어 향후 void-use 활성화 시 추가 작업 불필요)
 - `.eslintrc` / lint 스크립트 구조 변경 — 본 스코프 외
-- 백엔드 `App\Support\Review\ClientNameComparator.php` 수정 — 비동치 확인 시 별도 PR (구현 단계에서 이슈 발행 후 스펙에 번호 역참조)
-- `kFormatter` 의 음수 부호 탈락 — 기존 구현 동작 유지, 별도 이슈 (구현 단계에서 발행)
+- 백엔드 `App\Support\Review\ClientNameComparator.php` 수정 — 비동치 확정. 추적: #610
+- `kFormatter` 의 음수 부호 탈락 — 기존 구현 동작 유지. 추적: #611
 
 ## 9. 롤백
 

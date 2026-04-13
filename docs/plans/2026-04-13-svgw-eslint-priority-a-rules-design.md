@@ -68,7 +68,7 @@ export const passwordValidator = (password: string) => {
 const EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/
 ```
 
-**구현 착수 전 PoC 필수**: 위 regex 를 임시 파일에 넣고 `bun run lint` 통과 확인. **PoC 결과는 구현 PR 본문에 명시 후 착수**. 만약 `sonarjs/slow-regex` 가 여전히 잡으면:
+**구현 착수 전 PoC 필수**: 위 regex + `forceRepaint` 헬퍼 (§4.5) 모두를 포함한 임시 파일에서 `bun run lint` 통과 확인 (sonarjs 기타 룰 간섭 동시 검증). **PoC 결과는 구현 PR 본문에 명시 후 착수**. 만약 `sonarjs/slow-regex` 가 여전히 잡으면:
 - (a) 동일 구조의 공식 HTML5 regex 이므로 eslint-disable-next-line 으로 억제 (주석에 HTML5 spec 링크)
 - (b) 또는 전체 email 검증을 브라우저 `input[type=email]` 검사 + 간단한 `@` 포함·길이 체크로 교체 (예: `/^[^\s@]+@[^\s@]+\.[^\s@]+$/`)
 
@@ -127,6 +127,8 @@ export const kFormatter = (num: number) => {
 ```ts
 // regex 천단위 구분 대신 Intl 기반 locale-aware 포맷 사용.
 // 기존 toFixed(0) 과 동치성을 위해 Math.round 사용 (Math.floor 는 1234.7 → "1,234" 로 1 차이 회귀).
+// Math.round 는 half-to-positive-infinity (`Math.round(-0.5)===0`) 이지만, 본 함수는
+// Math.abs 를 거친 후 round 하므로 항상 양수 도메인 → toFixed(0) 과 완전 동치.
 // 기존 동작 유지 사항: abs ≤ 9999 음수 입력 시 부호 탈락 (`-500 → "500"`) — 의도적 보존.
 export const kFormatter = (num: number) => {
   const abs = Math.abs(num)
@@ -219,7 +221,12 @@ setup(_, { slots }) {
    ```
    → ts-eslint/recommended preset 기본값(error) 복귀.
 
-3. `#607` 주석에서 Priority A 3건 완료 표기 및 해당 줄의 "별도 이슈 재활성화 추적" 주석 보강.
+3. `#607` 주석에서 Priority A 3건 완료 표기. `legacyOffRules` 상단 주석 및 `tsRules` 주석 갱신 예:
+   ```js
+   // 섹션 1: legacy-compat off
+   // (전략) 재활성화 추적: #607 (Priority A 완료 / Priority B, C 진행중).
+   ```
+   그리고 `tsRules` 내 `@typescript-eslint/no-unused-expressions` 주석은 제거 (룰 자체가 error 로 돌아오므로).
 
 ## 6. 검증
 
@@ -271,7 +278,7 @@ setup(_, { slots }) {
 
 | 리스크 | 대응 |
 | --- | --- |
-| email regex 교체 시 IP literal (`user@[192.168.1.1]`) 거부로 기존 가입자 영향 | DB 조회 (`SELECT COUNT(*) FROM users WHERE email LIKE '%@[%]%'`) 결과 0 확인 전제. 구현 단계에서 실제 쿼리 수행 후 스펙에 결과 명시. N>0 이면 기존 regex 유지 + eslint-disable 로 전략 변경 |
+| email regex 교체 시 IP literal (`user@[192.168.1.1]`) 거부로 기존 가입자 영향 | DB 조회 (`SELECT COUNT(*) FROM users WHERE email REGEXP '@\\\\['`) 결과 0 확인 전제. 구현 단계에서 실제 쿼리 수행 후 PR 본문에 결과 명시. N>0 이면 기존 regex 유지 + eslint-disable 로 전략 변경 |
 | `clientNameComparator` 의 `\s` 와 백엔드 PHP `\s` 차이 (PHP `\s` 는 ASCII 만) | 백엔드 regex 확인. 비동치 시 양쪽 통일은 별도 PR 로 분리 (본 PR 은 프론트엔드만) |
 | 신규 email regex 가 `sonarjs/slow-regex` 에 재차 flag 될 가능성 | 구현 착수 전 PoC (임시 파일 + `bun run lint`) 필수. flag 시 HTML5 spec 링크 주석 + `eslint-disable-next-line` 또는 `/^[^\s@]+@[^\s@]+\.[^\s@]+$/` 단순 regex 대체 |
 | `kFormatter` 부호 탈락 (`-500 → "500"`) | 기존 구현의 사전 존재 동작. 본 PR 은 의도적으로 동작 보존 (수정은 별도 이슈) |
@@ -284,10 +291,10 @@ setup(_, { slots }) {
 
 - Priority B/C 룰 — 후속 스펙
 - 테스트 러너 도입 (vitest 등) — 별도 이슈
-- `sonarjs/void-use` — off 유지 (forceRepaint 패턴이 void 의존 제거)
+- `sonarjs/void-use` — off 유지 (참고: forceRepaint 헬퍼 도입으로 void 의존이 제거되어 향후 void-use 활성화 시 추가 작업 불필요)
 - `.eslintrc` / lint 스크립트 구조 변경 — 본 스코프 외
-- 백엔드 `App\Support\Review\ClientNameComparator.php` 수정 — 비동치 확인 시 별도 PR
-- `kFormatter` 의 음수 부호 탈락 — 기존 구현 동작 유지, 별도 이슈
+- 백엔드 `App\Support\Review\ClientNameComparator.php` 수정 — 비동치 확인 시 별도 PR (구현 단계에서 이슈 발행 후 스펙에 번호 역참조)
+- `kFormatter` 의 음수 부호 탈락 — 기존 구현 동작 유지, 별도 이슈 (구현 단계에서 발행)
 
 ## 9. 롤백
 

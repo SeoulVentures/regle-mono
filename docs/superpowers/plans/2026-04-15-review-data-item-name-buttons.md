@@ -1,96 +1,53 @@
-# review/data 자사몰 상품명 초기화·강제수집 버튼 — 구현 플랜
+# review/data 자사몰 상품명 초기화·강제수집 — 구현 플랜
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development (권장) or superpowers:executing-plans.
 
-**Goal:** SVGW `/review/data` 페이지에 자사몰 상품명 **초기화**·**강제 수집** 버튼 2개 (선택/전체 모드) 를 추가하여 `is_name_checked=1` 로 고착된 placeholder 상품명을 운영자가 복구할 수 있게 한다.
+**Goal:** SVGW `/review/data` 에 자사몰 상품명 **초기화**·**강제 수집** 버튼 2개 (선택/전체) 추가. `is_name_checked=1` 고착 상품 복구 수단.
 
-**Architecture:** regle 쪽은 기존 `scan_client_items` 에 `flag_force` 파라미터만 추가 (채널용 `scan_target_titles_by_review_target_item_maps(flag_force=True)` 의 대칭). SVGW 쪽은 기존 `ReviewScanController` 에 `resetClientItemNames` 액션 추가 + `scanClientItems` 에 `force` 쿼리 수용. dispatch 는 기존 `RegleEcsService` (ECS RunTask) 재사용.
-
-**Tech Stack:**
-- regle: Python 3.12, SQLModel, Typer, pytest
-- SVGW: Laravel 10, Vue 3 + TypeScript + Vuetify 3, Bun, PHPUnit
-- dispatch: AWS ECS Fargate (기존 `regle-worker-cli-production` 태스크 정의)
+**Architecture:** regle 은 `scan_client_items` 에 `flag_force` 파라미터만 추가 (채널용 대칭). SVGW 는 기존 `ReviewScanController` 확장 + 초기화 액션 신규. Dispatch 는 기존 `RegleEcsService` (ECS RunTask) 재사용.
 
 **Spec:** `docs/superpowers/specs/2026-04-15-review-data-item-name-buttons-design.md`
 
----
+## 검증된 전제 (구현 전 이미 확인)
 
-## 전체 순서
-
-**Phase A (regle)**: Task 1~5 — `flag_force` 파라미터 추가 + CLI + pytest + PR
-**Phase Gate**: regle PR 머지 + ECS 이미지 배포 확인
-**Phase B (SVGW)**: Task 6~13 — 초기화 API + 강제 수집 force + 프론트 버튼 + PR
-
-regle 은 하위 호환 (default False) 이므로 SVGW 가 regle 보다 먼저 올라가면 SVGW 에서 force 요청해도 regle 구버전이 무시하고 기존 동작. 동작은 하지만 "강제" 가 되지 않으므로 운영상 regle 이 먼저 올라가야 함.
-
----
-
-## File Structure
-
-### regle (review-moai-refactoring 서브모듈)
-- Modify: `app/drivers/BaseUploadDriver.py:473-540` — `scan_client_items` 시그니처 + 스킵 가드
-- Modify: `regle/services/review/client_service.py:75-80` — `flag_force` 전달
-- Modify: `regle/typer_cli/task_cli.py:55-63` — `--force` CLI 옵션
-- Create: `tests/unit/drivers/test_base_upload_scan_force.py` — pytest
-
-### SVGW (SeoulVenturesGroupware 서브모듈)
-- Modify: `app/Http/Controllers/ReviewUploader/ReviewScanController.php` — `force` 파라미터 수용 + `resetClientItemNames` 메서드 신규
-- Modify: `app/Services/RegleEcsService.php:295-302` — `scanClientItems` 에 `force` 인자
-- Modify: `routes/api.php:402` 부근 — reset 엔드포인트 추가
-- Create: `tests/Feature/Review/ResetClientItemNamesTest.php`
-- Create: `tests/Feature/Review/ForceScanClientItemsTest.php`
-- Modify: `frontend/resources/ts/api/entities/review/clientItems.ts` — `resolveProductNames` 에 `force` 옵션 + `resetProductNames` 메서드 신규
-- Modify: `frontend/resources/ts/pages/review/data/index.vue:539-617 부근` — 버튼 2개 + 핸들러 4개 (선택·전체 × 초기화·강제)
+- **regle CLI 진입점**: `regle/typer_cli/task_cli.py:55 scan_client_items(target_item_maps: str)`
+- **regle 스킵 가드**: `app/drivers/BaseUploadDriver.py:494-504` — `item_name` 유효 + `item_url` 있음 + `is_name_checked=True` 일 때 skip
+- **SVGW 컨트롤러**: `app/Http/Controllers/ReviewUploader/ReviewScanController.php:34 scanClientItems`
+- **SVGW 서비스**: `app/Services/RegleEcsService.php:295 scanClientItems`
+- **SVGW `buildArgs`** (L270 부근): bool 처리 **없음** → `--force=1` 을 토해냄. Typer `--force/--no-force` 와 불일치 → **buildArgs 수정 필요** (Task 5)
+- **SVGW 테스트 DB 정책**: retaku_admin 외부 RDS, `RefreshDatabase` 미사용. 기존 패턴 → `$this->skipIfDatabaseUnavailable('retaku_admin')` + `DB::connection('retaku_admin')->table()->insert()`. 참고: `tests/Feature/Review/TargetItemMapDeleteBulkAuditTest.php`
+- **SVGW factory**: `ClientFactory`, `TargetItemMapFactory` 있음. **`ClientItemFactory` 없음** → DB 직접 insert
+- **SVGW 프론트 기존 드롭다운 패턴**: `frontend/resources/ts/pages/review/data/index.vue:1377` 의 `VMenu > VList > VListItem` 구조 복제
 
 ---
 
-# Phase A — regle 변경
+# Phase A — regle (review-moai-refactoring)
 
-## Task 1: `BaseUploadDriver.scan_client_items` 에 `flag_force` 파라미터 추가
+## Task 1: `scan_client_items` 에 `flag_force` 추가
 
 **Files:**
-- Modify: `review-moai-refactoring/app/drivers/BaseUploadDriver.py:473-504`
-- Test: `review-moai-refactoring/tests/unit/drivers/test_base_upload_scan_force.py` (create)
+- Modify `app/drivers/BaseUploadDriver.py:473-504`
+- Modify `regle/services/review/client_service.py:75-80`
+- Modify `regle/typer_cli/task_cli.py:55-63`
+- Create `tests/unit/drivers/test_base_upload_scan_force.py`
 
-현재 `scan_client_items(target_item_maps: str = None)` 의 스킵 가드:
-```python
-flag_try = True
-if review_client_item.item_name is not None:
-    if review_client_item.item_name.strip() != "":
-        flag_try = False
-        if "403" in review_client_item.item_name and "Forbidden" in review_client_item.item_name:
-            flag_try = True
-if review_client_item.item_url is None:
-    flag_try = True
-if review_client_item.is_name_checked is not True:
-    flag_try = True
+- [ ] **Step 1: 브랜치**
 
-if not flag_try:
-    continue
-```
-
-→ `flag_force=True` 일 때는 위 가드 전체를 우회하고 무조건 수집 시도.
-
-- [ ] **Step 1: regle 브랜치 생성**
-
-Run:
 ```bash
 cd /opt/SeoulVentures/regle/review-moai-refactoring
 git checkout -b feature/scan-client-items-force
 ```
 
-- [ ] **Step 2: 실패하는 pytest 작성** — 새 파일 `tests/unit/drivers/test_base_upload_scan_force.py`
+- [ ] **Step 2: 실패 테스트 작성** — `tests/unit/drivers/test_base_upload_scan_force.py`
 
 ```python
-"""scan_client_items 의 flag_force 동작 검증."""
+"""scan_client_items flag_force 검증."""
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from app.drivers.BaseUploadDriver import BaseUploadDriver
 
 
-def _make_driver_with_item(*, item_name: str, is_name_checked: bool, item_url: str = "https://example.com/p/1"):
+def _driver(item_name="바닐라코 상품", is_name_checked=True):
     client = MagicMock()
     client.product_url_pattern = "https://example.com/p/{product_id}"
     client.product_scan_type = "head"
@@ -99,87 +56,65 @@ def _make_driver_with_item(*, item_name: str, is_name_checked: bool, item_url: s
     item = MagicMock()
     item.item_name = item_name
     item.is_name_checked = is_name_checked
-    item.item_url = item_url
+    item.item_url = "https://example.com/p/1"
     item.item_code = "1"
 
     map_row = MagicMock()
     map_row.get_review_client_item.return_value = item
     client.get_review_target_item_maps.return_value = [map_row]
 
-    driver = BaseUploadDriver.__new__(BaseUploadDriver)
-    driver._review_client = client
-    driver._BaseUploadDriver__validate_and_fix_items = MagicMock()  # private method no-op
-    return driver, item
+    d = BaseUploadDriver.__new__(BaseUploadDriver)
+    d._review_client = client
+    d._BaseUploadDriver__validate_and_fix_items = MagicMock()
+    return d
 
 
-def test_scan_skips_when_name_checked_and_default_mode():
-    """default (flag_force=False) 는 is_name_checked=True + 정상 name 이면 스킵."""
-    driver, item = _make_driver_with_item(item_name="바닐라코 상품", is_name_checked=True)
-    with patch("app.drivers.BaseUploadDriver.get_redis_conn") as redis_mock, \
-         patch("app.drivers.BaseUploadDriver.requests.get") as req_mock:
-        redis_mock.return_value.__enter__.return_value.exists.return_value = True
-        redis_mock.return_value.__enter__.return_value.get.return_value = b"1"
-        driver.scan_client_items()
-    req_mock.assert_not_called()  # 스킵되어야 함
+def _with_mocks(req_status=200):
+    redis = patch("app.drivers.BaseUploadDriver.get_redis_conn")
+    req = patch("app.drivers.BaseUploadDriver.requests.get")
+    return redis, req
 
 
-def test_scan_forces_recollect_when_flag_force_true():
-    """flag_force=True 는 is_name_checked=True + 정상 name 이어도 수집 시도."""
-    driver, item = _make_driver_with_item(item_name="바닐라코 상품", is_name_checked=True)
-    with patch("app.drivers.BaseUploadDriver.get_redis_conn") as redis_mock, \
-         patch("app.drivers.BaseUploadDriver.requests.get") as req_mock:
-        redis_mock.return_value.__enter__.return_value.exists.return_value = True
-        redis_mock.return_value.__enter__.return_value.get.return_value = b"1"
-        req_mock.return_value.status_code = 200
-        req_mock.return_value.encoding = "utf-8"
-        req_mock.return_value.apparent_encoding = "utf-8"
-        req_mock.return_value.content = b"<html><head><title>새 상품명</title></head></html>"
-        driver.scan_client_items(flag_force=True)
-    req_mock.assert_called_once()  # 강제 수집되어야 함
+def test_default_skips_when_name_checked():
+    d = _driver()
+    redis_mock, req_mock = _with_mocks()
+    with redis_mock as rm, req_mock as qm:
+        rm.return_value.__enter__.return_value.exists.return_value = True
+        rm.return_value.__enter__.return_value.get.return_value = b"1"
+        d.scan_client_items()
+        qm.assert_not_called()
+
+
+def test_force_true_overrides_skip():
+    d = _driver()
+    redis_mock, req_mock = _with_mocks()
+    with redis_mock as rm, req_mock as qm:
+        rm.return_value.__enter__.return_value.exists.return_value = True
+        rm.return_value.__enter__.return_value.get.return_value = b"1"
+        qm.return_value.status_code = 200
+        qm.return_value.encoding = "utf-8"
+        qm.return_value.apparent_encoding = "utf-8"
+        qm.return_value.content = b"<html><head><title>새 상품명</title></head></html>"
+        d.scan_client_items(flag_force=True)
+        qm.assert_called_once()
 ```
 
-- [ ] **Step 3: 테스트 실행 — 실패 확인**
-
-Run:
+실행 → 실패 확인:
 ```bash
-cd /opt/SeoulVentures/regle/review-moai-refactoring
 .venv/bin/pytest tests/unit/drivers/test_base_upload_scan_force.py -v
 ```
-Expected: `TypeError: scan_client_items() got an unexpected keyword argument 'flag_force'` (test_scan_forces_recollect_when_flag_force_true 실패)
 
-- [ ] **Step 4: `BaseUploadDriver.scan_client_items` 수정**
+- [ ] **Step 3: 3개 파일 동시 수정**
 
-Edit `app/drivers/BaseUploadDriver.py:473`. 시그니처 변경:
+**a) `app/drivers/BaseUploadDriver.py:473`** — 시그니처 + 가드 우회 삽입
 
 ```python
-# BEFORE (line 473)
-def scan_client_items(self, target_item_maps: str = None):
-
-# AFTER
 def scan_client_items(self, target_item_maps: str = None, flag_force: bool = False):
 ```
 
-그리고 스킵 가드 직후 (기존 `if not flag_try: continue` 의 바로 위, 약 line 503 부근) 에 추가:
+기존 가드 블록 끝의 `if not flag_try: continue` 직전에 추가:
 
 ```python
-                if flag_force:
-                    flag_try = True
-                if not flag_try:
-                    continue
-```
-
-최종적인 스킵 블록:
-```python
-                flag_try = True
-                if review_client_item.item_name is not None:
-                    if review_client_item.item_name.strip() != "":
-                        flag_try = False
-                        if "403" in review_client_item.item_name and "Forbidden" in review_client_item.item_name:
-                            flag_try = True
-                if review_client_item.item_url is None:
-                    flag_try = True
-                if review_client_item.is_name_checked is not True:
-                    flag_try = True
                 if flag_force:
                     flag_try = True
 
@@ -187,54 +122,7 @@ def scan_client_items(self, target_item_maps: str = None, flag_force: bool = Fal
                     continue
 ```
 
-- [ ] **Step 5: 테스트 실행 — 통과 확인**
-
-Run:
-```bash
-cd /opt/SeoulVentures/regle/review-moai-refactoring
-.venv/bin/pytest tests/unit/drivers/test_base_upload_scan_force.py -v
-```
-Expected: 2 passed
-
-- [ ] **Step 6: ruff lint + format**
-
-Run:
-```bash
-.venv/bin/ruff check app/drivers/BaseUploadDriver.py tests/unit/drivers/test_base_upload_scan_force.py --fix
-.venv/bin/ruff format app/drivers/BaseUploadDriver.py tests/unit/drivers/test_base_upload_scan_force.py
-```
-
-- [ ] **Step 7: 커밋**
-
-```bash
-git add app/drivers/BaseUploadDriver.py tests/unit/drivers/test_base_upload_scan_force.py
-git commit -m "feat(scan): scan_client_items 에 flag_force 파라미터 추가
-
-채널용 scan_target_titles_by_review_target_item_maps 와 대칭을 맞춰
-자사몰 상품명 수집에서도 is_name_checked=True 상품을 강제로 덮어쓸 수
-있게 한다. default False 로 기존 호출부 동작은 불변."
-```
-
----
-
-## Task 2: `ClientService.scan_client_items` 에 `flag_force` 전달
-
-**Files:**
-- Modify: `review-moai-refactoring/regle/services/review/client_service.py:75-80`
-
-현재:
-```python
-@ToSlackClient("<@{user}> {client_name}의 자사몰 상품명 수집")
-def scan_client_items(self, maps=None):
-    upload_driver = self.client.get_upload_drvier()
-    if not upload_driver:
-        upload_driver = BaseUploadDriver(self.client)
-    upload_driver.scan_client_items(maps)
-```
-
-- [ ] **Step 1: 코드 수정**
-
-Edit `regle/services/review/client_service.py:75-80`:
+**b) `regle/services/review/client_service.py:76`**:
 
 ```python
 @ToSlackClient("<@{user}> {client_name}의 자사몰 상품명 수집")
@@ -245,41 +133,7 @@ def scan_client_items(self, maps=None, flag_force: bool = False):
     upload_driver.scan_client_items(maps, flag_force=flag_force)
 ```
 
-- [ ] **Step 2: 기존 호출부 확인**
-
-Run:
-```bash
-grep -rn "scan_client_items" regle/ app/ --include="*.py"
-```
-
-Expected: 기존 호출부는 `ClientService(id, user).scan_client_items(map_ids)` 형태로 `flag_force` 미전달 → default False → 기존 동작 유지. 수정 불필요.
-
-- [ ] **Step 3: 전체 pytest 실행 — 회귀 없음 확인**
-
-Run:
-```bash
-.venv/bin/pytest tests/ -x -q 2>&1 | tail -20
-```
-
-Expected: 기존 테스트가 깨지지 않음 (기존 호출부 동작 불변)
-
-- [ ] **Step 4: 커밋**
-
-```bash
-git add regle/services/review/client_service.py
-git commit -m "feat(scan): ClientService.scan_client_items 에 flag_force 전달"
-```
-
----
-
-## Task 3: CLI `--force` 옵션 추가
-
-**Files:**
-- Modify: `review-moai-refactoring/regle/typer_cli/task_cli.py:55-63`
-
-- [ ] **Step 1: 코드 수정**
-
-Edit `regle/typer_cli/task_cli.py:55-63`. 시그니처/본문 변경:
+**c) `regle/typer_cli/task_cli.py:55`**:
 
 ```python
 @app.command()
@@ -294,247 +148,103 @@ def scan_client_items(
     print(f"상품 스캔이 완료되었습니다.{id}")
 ```
 
-- [ ] **Step 2: CLI 스모크 테스트**
-
-Run:
-```bash
-.venv/bin/python regle_cli.py scan-client-items --help
-```
-
-Expected: `--force` 와 `--no-force` 옵션이 help 에 노출
-
-- [ ] **Step 3: 커밋**
+- [ ] **Step 4: 테스트 통과 + 회귀 확인**
 
 ```bash
-git add regle/typer_cli/task_cli.py
-git commit -m "feat(cli): scan-client-items 에 --force 옵션 추가"
-```
-
----
-
-## Task 4: 전체 테스트 + ruff 최종 점검
-
-- [ ] **Step 1: 전체 pytest**
-
-Run:
-```bash
+.venv/bin/pytest tests/unit/drivers/test_base_upload_scan_force.py -v
 .venv/bin/pytest tests/ -q
+.venv/bin/ruff check app/drivers/BaseUploadDriver.py regle/ tests/unit/drivers/test_base_upload_scan_force.py --fix
+.venv/bin/ruff format app/drivers/BaseUploadDriver.py regle/services/review/client_service.py regle/typer_cli/task_cli.py tests/unit/drivers/test_base_upload_scan_force.py
+.venv/bin/python regle_cli.py scan-client-items --help | grep -- "--force"
 ```
 
-Expected: 전 테스트 통과 (신규 2건 포함)
+기대: 신규 2 통과, 기존 회귀 없음, `--force/--no-force` 옵션 노출.
 
-- [ ] **Step 2: ruff 전체 점검**
+- [ ] **Step 5: 커밋 + PR**
 
-Run:
 ```bash
-.venv/bin/ruff check app/ regle/ tests/
-```
+git add app/drivers/BaseUploadDriver.py regle/services/review/client_service.py regle/typer_cli/task_cli.py tests/unit/drivers/test_base_upload_scan_force.py
+git commit -m "feat(scan): scan_client_items 에 flag_force 파라미터 추가
 
-Expected: 0 issues (신규 변경 범위 한정)
-
-- [ ] **Step 3: 수정 필요 시 반영 후 재실행. 문제 없으면 다음 태스크로.**
-
----
-
-## Task 5: regle PR 생성
-
-- [ ] **Step 1: 푸시**
-
-Run:
-```bash
-cd /opt/SeoulVentures/regle/review-moai-refactoring
+채널용 scan_target_titles_by_review_target_item_maps 와 대칭.
+default False 로 기존 호출부 동작 불변."
 git push -u origin feature/scan-client-items-force
-```
 
-- [ ] **Step 2: Draft PR 생성**
-
-Run:
-```bash
 gh pr create --draft \
   --title "feat(scan): scan_client_items 에 flag_force 파라미터 추가" \
-  --body "$(cat <<'EOF'
-## Summary
-- `BaseUploadDriver.scan_client_items` 에 `flag_force: bool = False` 파라미터 추가
-- `ClientService.scan_client_items` 가 이를 전달
-- CLI `scan-client-items` 에 `--force` 옵션 노출
-- 채널용 `scan_target_titles_by_review_target_item_maps(flag_force=True)` 와 대칭 구조
+  --body "SVGW 의 자사몰 상품명 강제수집 버튼이 의존하는 워커 변경.
 
-## Spec
-regle/docs/superpowers/specs/2026-04-15-review-data-item-name-buttons-design.md (메인 repo)
+- BaseUploadDriver / ClientService / CLI 3계층에 flag_force 전달
+- default False → 기존 호출부 (periodic, ConfigService 등) 동작 불변
+- CLI: --force/--no-force 옵션 노출
 
-## 배경
-`/review/data` 페이지의 자사몰 상품명 수집 버튼이 `is_name_checked=1` 상품에 대해 스킵 → placeholder 값 (예: 몰 이름) 이 고착. 강제 덮어쓰기 수단 필요. 이 PR 은 워커 쪽 대칭만 제공. SVGW 쪽에서 `force` 쿼리로 활용 예정.
-
-## 호환성
-- `flag_force` default `False` — 기존 호출부 동작 완전 불변
-- 기존 호출부 grep: `regle/typer_cli/task_cli.py:62` 와 `periodic_regle.py`, `ConfigService` 등 모두 `flag_force` 미전달. default False 로 동작
-
-## Test plan
-- [x] pytest 통과 (`tests/unit/drivers/test_base_upload_scan_force.py` 신규 2건)
-- [x] 기존 pytest 회귀 없음
-- [x] ruff 통과
-- [ ] 리뷰 후 ready → 머지 → ECS 이미지 배포 → SVGW PR 진행
-EOF
-)"
+관련 스펙: regle 메인 repo docs/superpowers/specs/2026-04-15-review-data-item-name-buttons-design.md"
 ```
 
-- [ ] **Step 3: PR URL 기록** — 이후 SVGW PR 본문에 참조하기 위해 URL 저장
+PR URL 기록해둘 것 (Task 6 PR body 에서 링크).
 
 ---
 
-## Phase Gate — regle 머지 후 ECS 이미지 반영 확인
+## Phase Gate (regle → SVGW)
 
-이 단계는 **사용자 승인 필요**. 자동 진행 금지.
+사용자 승인 후에만 진행. **자동화 금지.**
 
-- [ ] **Step 1: regle PR 리뷰 → 사용자 승인 후 머지** (외부 액션)
-
-- [ ] **Step 2: GitHub Actions 배포 완료 대기**
-
-Run:
-```bash
-cd /opt/SeoulVentures/regle/review-moai-refactoring
-gh run list --workflow=deploy.yml --limit=3
-```
-
-Expected: 최신 master 빌드가 `completed success`
-
-- [ ] **Step 3: ECS 태스크 정의의 이미지 태그 갱신 확인**
-
-Run:
-```bash
-aws ecs describe-task-definition --task-definition regle-worker-cli-production \
-  --region ap-northeast-2 \
-  --query 'taskDefinition.{revision:revision,image:containerDefinitions[0].image}' \
-  --output json
-```
-
-Expected: revision 이 증가 + image tag 가 새 SHA
-
-- [ ] **Step 4: 신규 이미지로 `--help` dry-run**
-
-Run:
-```bash
-aws ecs run-task --cluster regle-worker \
-  --task-definition regle-worker-cli-production \
-  --launch-type FARGATE --platform-version LATEST \
-  --network-configuration 'awsvpcConfiguration={subnets=[subnet-2a24cc66],assignPublicIp=ENABLED}' \
-  --overrides '{"containerOverrides":[{"name":"regle-worker","command":["python","regle_cli.py","scan-client-items","--help"]}]}' \
-  --region ap-northeast-2 --query 'tasks[0].taskArn' --output text
-```
-
-그리고 30-60초 후 CloudWatch 로그 확인:
-```bash
-aws logs filter-log-events --log-group-name /ecs/regle-worker-cli-production \
-  --region ap-northeast-2 \
-  --start-time $(( $(date +%s) * 1000 - 300000 )) \
-  --filter-pattern '"--force"' --max-items 5 \
-  --query 'events[].message' --output text
-```
-
-Expected: `--force` 옵션이 help 출력에 포함
-
-- [ ] **Step 5: Phase B 진행 승인 받기**
+- [ ] **Step 1**: regle PR 승인/머지 (외부)
+- [ ] **Step 2**: GH Actions 배포 완료 확인
+  ```bash
+  gh run list --workflow=deploy.yml --limit=3 --repo SeoulVentures/review-moai-refactoring
+  ```
+- [ ] **Step 3**: ECS 태스크 정의 revision 증가 확인
+  ```bash
+  aws ecs describe-task-definition --task-definition regle-worker-cli-production \
+    --region ap-northeast-2 \
+    --query 'taskDefinition.{revision:revision,image:containerDefinitions[0].image}'
+  ```
+- [ ] **Step 4**: 사용자 Phase B 착수 승인
 
 ---
 
-# Phase B — SVGW 변경
+# Phase B — SVGW (SeoulVenturesGroupware)
 
-## Task 6: SVGW 브랜치 생성 + 기존 코드 재확인
+## Task 2: SVGW 브랜치 + `buildArgs` bool fix + service/controller 변경
 
-- [ ] **Step 1: 브랜치 생성**
+**Files:**
+- Modify `app/Services/RegleEcsService.php` (buildArgs + scanClientItems)
+- Modify `app/Http/Controllers/ReviewUploader/ReviewScanController.php` (scanClientItems)
 
-Run:
+- [ ] **Step 1: 브랜치**
+
 ```bash
 cd /opt/SeoulVentures/regle/SeoulVenturesGroupware
 git checkout master && git pull
 git checkout -b feature/review-data-item-name-reset-force
 ```
 
-- [ ] **Step 2: routes 구조 확인**
+- [ ] **Step 2: `buildArgs` 에 bool 지원 추가**
 
-Run:
-```bash
-grep -n "scan-client-items\|review-uploader/clients" routes/api.php | head -10
-```
+Edit `app/Services/RegleEcsService.php` — `buildArgs` 메서드 수정:
 
-Expected: `routes/api.php:255` 와 `:402` 에 유사 라우트 2개 (중복 등록 → 하나의 그룹 내). 신규 reset 엔드포인트는 :402 구간의 그룹에 추가.
-
----
-
-## Task 7: `RegleEcsService::scanClientItems` 에 `force` 인자 추가
-
-**Files:**
-- Modify: `SeoulVenturesGroupware/app/Services/RegleEcsService.php:295-302`
-- Test: `SeoulVenturesGroupware/tests/Feature/Review/ForceScanClientItemsTest.php` (create)
-
-현재:
 ```php
-public function scanClientItems(int $clientId, ?array $targetItemMaps = null, ?string $requestUser = null): array
+private function buildArgs(array $params): string
 {
-    return $this->runTask('scan-client-items', [
-        'id' => $clientId,
-        'user' => $requestUser,
-        'map_ids' => $targetItemMaps ? implode(',', $targetItemMaps) : null,
-    ]);
+    $args = [];
+    foreach ($params as $key => $value) {
+        if ($value === null || $value === false) {
+            continue;
+        }
+        $key = str_replace('_', '-', $key);
+        if ($value === true) {
+            $args[] = "--{$key}";
+            continue;
+        }
+        $sanitized = str_replace(' ', '_', (string) $value);
+        $args[] = "--{$key}={$sanitized}";
+    }
+    return implode(' ', $args);
 }
 ```
 
-- [ ] **Step 1: 실패하는 feature 테스트 작성** — `tests/Feature/Review/ForceScanClientItemsTest.php`
-
-```php
-<?php
-
-namespace Tests\Feature\Review;
-
-use App\Services\RegleEcsService;
-use Mockery;
-use Tests\TestCase;
-
-class ForceScanClientItemsTest extends TestCase
-{
-    public function test_force_true_passes_force_flag_to_ecs_service(): void
-    {
-        $mock = Mockery::mock(RegleEcsService::class);
-        $mock->shouldReceive('scanClientItems')
-            ->once()
-            ->with(1538, null, null, true)
-            ->andReturn(['success' => true, 'taskArn' => 'arn:test']);
-        $this->app->instance(RegleEcsService::class, $mock);
-
-        $res = $this->postJson('/api/review-uploader/clients/1538/scan-client-items', [
-            'force' => true,
-        ]);
-
-        $res->assertOk()->assertJson(['success' => true]);
-    }
-
-    public function test_force_default_false_preserves_existing_behavior(): void
-    {
-        $mock = Mockery::mock(RegleEcsService::class);
-        $mock->shouldReceive('scanClientItems')
-            ->once()
-            ->with(1538, null, null, false)
-            ->andReturn(['success' => true]);
-        $this->app->instance(RegleEcsService::class, $mock);
-
-        $res = $this->postJson('/api/review-uploader/clients/1538/scan-client-items');
-
-        $res->assertOk();
-    }
-}
-```
-
-- [ ] **Step 2: 테스트 실행 — 실패 확인**
-
-Run:
-```bash
-cd /opt/SeoulVentures/regle/SeoulVenturesGroupware
-vendor/bin/phpunit --filter=ForceScanClientItemsTest
-```
-
-Expected: `TooManyArguments` 또는 method signature mismatch 로 실패
-
-- [ ] **Step 3: `RegleEcsService::scanClientItems` 시그니처 확장**
+- [ ] **Step 3: `scanClientItems` 에 `$force` 인자 추가**
 
 Edit `app/Services/RegleEcsService.php:295`:
 
@@ -545,53 +255,18 @@ public function scanClientItems(
     ?string $requestUser = null,
     bool $force = false,
 ): array {
-    $params = [
+    return $this->runTask('scan-client-items', [
         'id' => $clientId,
         'user' => $requestUser,
         'map_ids' => $targetItemMaps ? implode(',', $targetItemMaps) : null,
-    ];
-    if ($force) {
-        $params['force'] = true;
-    }
-
-    return $this->runTask('scan-client-items', $params);
+        'force' => $force ?: null,
+    ]);
 }
 ```
 
-주의: `buildArgs` 가 bool true 를 `--force` 플래그로 변환하는지 확인:
+- [ ] **Step 4: Controller 의 `scanClientItems` 가 `force` 읽도록**
 
-Run:
-```bash
-grep -n "buildArgs\|--'" app/Services/RegleEcsService.php | head -20
-```
-
-만약 bool 처리가 없으면 해당 부분도 추가해야 함 (Task 7a 로 취급). 확인 후 필요 시 아래 step 으로.
-
-- [ ] **Step 3a (조건부): `buildArgs` 에 bool flag 지원 추가**
-
-`buildArgs` 가 `bool true` 를 `--force` 단일 토큰으로, `false`/null 은 생략하는 방식인지 확인. 기존 구현 예시:
-
-```php
-private function buildArgs(array $params): array
-{
-    $args = [];
-    foreach ($params as $key => $value) {
-        if ($value === null || $value === false) continue;
-        if ($value === true) {
-            $args[] = "--{$key}";
-        } else {
-            $args[] = "--{$key}={$value}";
-        }
-    }
-    return $args;
-}
-```
-
-기존 구현이 이와 다르면 동등하게 맞춰 수정. 변경 시 `RegleEcsService` 내부 다른 사용처 회귀 확인 필수 (`scanItemTitles`, `scanTargets`, `buildSimilarity` 등 모두 bool 파라미터가 없는 메서드이므로 회귀 영향 없음).
-
-- [ ] **Step 4: `ReviewScanController::scanClientItems` 가 `force` 를 읽도록 수정**
-
-Edit `app/Http/Controllers/ReviewUploader/ReviewScanController.php:62-73`:
+Edit `app/Http/Controllers/ReviewUploader/ReviewScanController.php:62-70`:
 
 ```php
         $targetItemMaps = $request->has('target_item_maps')
@@ -606,51 +281,41 @@ Edit `app/Http/Controllers/ReviewUploader/ReviewScanController.php:62-73`:
             $request->header('X-Request-User'),
             $force,
         );
-
-        return response()->json($result, $result['success'] ? 200 : 500);
 ```
 
-- [ ] **Step 5: 기존 scan-client-items 라우트에 POST 메서드 추가**
+**Note**: 라우트는 기존 GET 유지. `force=true` 는 query string 으로 전달됨 (`GET /scan-client-items?force=true`).
 
-기존 라우트는 GET 임 (`routes/api.php:402`). `force` 를 body 로 받기 위해 POST 도 허용:
-
-Edit `routes/api.php:402` 라인을:
-
-```php
-Route::match(['get', 'post'], 'review-uploader/clients/{clientId}/scan-client-items', [ReviewScanController::class, 'scanClientItems']);
-```
-
-마찬가지로 `routes/api.php:255` 의 동일 중복 라우트도 같은 방식으로 수정.
-
-- [ ] **Step 6: 테스트 실행 — 통과 확인**
-
-Run:
-```bash
-vendor/bin/phpunit --filter=ForceScanClientItemsTest
-```
-
-Expected: 2 passed
-
-- [ ] **Step 7: 커밋**
+- [ ] **Step 5: 회귀 확인**
 
 ```bash
-git add app/Services/RegleEcsService.php app/Http/Controllers/ReviewUploader/ReviewScanController.php routes/api.php tests/Feature/Review/ForceScanClientItemsTest.php
+vendor/bin/phpunit --filter="RegleEcsService|ReviewScan" 2>&1 | tail
+```
+
+기존 테스트가 있다면 통과, 없다면 no tests run — OK.
+
+- [ ] **Step 6: 커밋**
+
+```bash
+git add app/Services/RegleEcsService.php app/Http/Controllers/ReviewUploader/ReviewScanController.php
 git commit -m "feat(review-scan): scan-client-items 에 force 파라미터 수용
 
-body 또는 query 로 force=true 전달 시 regle CLI 에 --force 플래그 추가.
-default false 로 기존 GET 호출 동작 불변."
+buildArgs 가 bool true 를 --key 단일 토큰으로 변환하도록 수정.
+regle Typer 의 --force/--no-force 와 호환.
+force=true query 전달 시 regle 워커에 --force 전달."
 ```
 
 ---
 
-## Task 8: `resetClientItemNames` 액션 추가 (Controller + Service + Routes)
+## Task 3: 초기화 API — `resetClientItemNames`
 
 **Files:**
-- Modify: `SeoulVenturesGroupware/app/Http/Controllers/ReviewUploader/ReviewScanController.php` — 메서드 추가
-- Modify: `SeoulVenturesGroupware/routes/api.php` — 엔드포인트 추가
-- Test: `SeoulVenturesGroupware/tests/Feature/Review/ResetClientItemNamesTest.php` (create)
+- Modify `app/Http/Controllers/ReviewUploader/ReviewScanController.php` (메서드 추가)
+- Modify `routes/api.php` (reset 라우트 등록)
+- Create `tests/Feature/Review/ResetClientItemNamesTest.php`
 
-- [ ] **Step 1: 실패하는 feature 테스트 작성** — `tests/Feature/Review/ResetClientItemNamesTest.php`
+- [ ] **Step 1: 실패 테스트 작성** — `tests/Feature/Review/ResetClientItemNamesTest.php`
+
+기존 `TargetItemMapDeleteBulkAuditTest` 패턴 복제. `Sanctum::actingAs` + `DB::connection('retaku_admin')` 직접 seed/cleanup.
 
 ```php
 <?php
@@ -658,132 +323,138 @@ default false 로 기존 GET 호출 동작 불변."
 namespace Tests\Feature\Review;
 
 use App\Models\Review\Client;
-use App\Models\Review\ClientItem;
-use App\Models\Review\TargetItemMap;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use App\Models\User;
+use Illuminate\Support\Facades\DB;
+use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
 class ResetClientItemNamesTest extends TestCase
 {
-    use RefreshDatabase;
-
-    private function makeClient(int $id = 1538): Client
+    private function seedItem(int $clientId, string $code, string $name = '바닐라닷컴'): int
     {
-        return Client::factory()->create(['id' => $id, 'name' => '바닐라코']);
-    }
-
-    public function test_reset_selected_map_ids_clears_item_name_and_flag(): void
-    {
-        $client = $this->makeClient();
-        $item = ClientItem::factory()->create([
-            'client_id' => $client->id,
-            'item_code' => '1177',
-            'item_name' => '바닐라닷컴',
+        return DB::connection('retaku_admin')->table('review_client_items')->insertGetId([
+            'client_id' => $clientId,
+            'item_code' => $code,
+            'item_name' => $name,
             'is_name_checked' => 1,
-        ]);
-        $map = TargetItemMap::factory()->create([
-            'client_id' => $client->id,
-            'client_item_code' => $item->item_code,
-        ]);
-
-        $res = $this->postJson(
-            "/api/review-uploader/clients/{$client->id}/reset-client-item-names",
-            ['map_ids' => [$map->id], 'all' => false],
-        );
-
-        $res->assertOk()->assertJson(['success' => true, 'reset_count' => 1]);
-        $this->assertDatabaseHas('review_client_items', [
-            'id' => $item->id, 'item_name' => null, 'is_name_checked' => 0,
+            'created_at' => now(),
+            'updated_at' => now(),
         ]);
     }
 
-    public function test_reset_all_mode_resets_every_mapped_item_for_client(): void
+    private function seedMap(int $clientId, string $clientItemCode, int $configId = 1): int
     {
-        $client = $this->makeClient();
-        foreach (['a', 'b'] as $code) {
-            $item = ClientItem::factory()->create([
-                'client_id' => $client->id, 'item_code' => $code,
-                'item_name' => 'X', 'is_name_checked' => 1,
+        return DB::connection('retaku_admin')->table('review_target_item_map')->insertGetId([
+            'client_id' => $clientId,
+            'config_id' => $configId,
+            'driver_code' => 'coupang_rocket',
+            'target_item_code' => 'T-'.$clientItemCode,
+            'client_item_code' => $clientItemCode,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+
+    private function cleanup(array $itemIds, array $mapIds, int $clientId): void
+    {
+        DB::connection('retaku_admin')->table('review_target_item_map')->whereIn('id', $mapIds)->delete();
+        DB::connection('retaku_admin')->table('review_client_items')->whereIn('id', $itemIds)->delete();
+        Client::destroy($clientId);
+    }
+
+    public function test_reset_selected_clears_name_and_flag(): void
+    {
+        $this->skipIfDatabaseUnavailable('retaku_admin');
+        Sanctum::actingAs(User::factory()->create(['email' => 'r1-'.uniqid().'@example.com']));
+
+        $client = Client::factory()->create(['name' => '테스트']);
+        $itemId = $this->seedItem($client->id, 'c1');
+        $mapId = $this->seedMap($client->id, 'c1');
+
+        try {
+            $res = $this->postJson("/api/review-uploader/clients/{$client->id}/reset-client-item-names", [
+                'map_ids' => [$mapId], 'all' => false,
             ]);
-            TargetItemMap::factory()->create([
-                'client_id' => $client->id, 'client_item_code' => $code,
-            ]);
+            $res->assertOk()->assertJson(['success' => true, 'reset_count' => 1]);
+
+            $row = DB::connection('retaku_admin')->table('review_client_items')->where('id', $itemId)->first();
+            $this->assertNull($row->item_name);
+            $this->assertSame(0, (int) $row->is_name_checked);
+        } finally {
+            $this->cleanup([$itemId], [$mapId], $client->id);
         }
+    }
 
-        $res = $this->postJson(
-            "/api/review-uploader/clients/{$client->id}/reset-client-item-names",
-            ['all' => true],
-        );
+    public function test_reset_all_mode_covers_every_mapped_item(): void
+    {
+        $this->skipIfDatabaseUnavailable('retaku_admin');
+        Sanctum::actingAs(User::factory()->create(['email' => 'r2-'.uniqid().'@example.com']));
 
-        $res->assertOk()->assertJson(['reset_count' => 2]);
+        $client = Client::factory()->create(['name' => '테스트']);
+        $ids = [$this->seedItem($client->id, 'a'), $this->seedItem($client->id, 'b')];
+        $maps = [$this->seedMap($client->id, 'a'), $this->seedMap($client->id, 'b')];
+
+        try {
+            $res = $this->postJson("/api/review-uploader/clients/{$client->id}/reset-client-item-names", ['all' => true]);
+            $res->assertOk()->assertJson(['reset_count' => 2]);
+        } finally {
+            $this->cleanup($ids, $maps, $client->id);
+        }
     }
 
     public function test_reset_does_not_touch_other_clients(): void
     {
-        $own = $this->makeClient(1538);
-        $other = $this->makeClient(1539);
+        $this->skipIfDatabaseUnavailable('retaku_admin');
+        Sanctum::actingAs(User::factory()->create(['email' => 'r3-'.uniqid().'@example.com']));
 
-        ClientItem::factory()->create([
-            'client_id' => $other->id, 'item_code' => 'zz',
-            'item_name' => 'keep', 'is_name_checked' => 1,
-        ]);
-        TargetItemMap::factory()->create([
-            'client_id' => $other->id, 'client_item_code' => 'zz',
-        ]);
+        $own = Client::factory()->create(['name' => '자기']);
+        $other = Client::factory()->create(['name' => '남']);
+        $otherItem = $this->seedItem($other->id, 'zz', 'keep');
+        $otherMap = $this->seedMap($other->id, 'zz');
 
-        $this->postJson(
-            "/api/review-uploader/clients/{$own->id}/reset-client-item-names",
-            ['all' => true],
-        )->assertOk();
+        try {
+            $this->postJson("/api/review-uploader/clients/{$own->id}/reset-client-item-names", ['all' => true])->assertOk();
 
-        $this->assertDatabaseHas('review_client_items', [
-            'client_id' => $other->id, 'item_name' => 'keep', 'is_name_checked' => 1,
-        ]);
+            $row = DB::connection('retaku_admin')->table('review_client_items')->where('id', $otherItem)->first();
+            $this->assertSame('keep', $row->item_name);
+            $this->assertSame(1, (int) $row->is_name_checked);
+        } finally {
+            $this->cleanup([$otherItem], [$otherMap], $other->id);
+            Client::destroy($own->id);
+        }
     }
 
     public function test_missing_map_ids_and_all_false_returns_422(): void
     {
-        $client = $this->makeClient();
-        $this->postJson(
-            "/api/review-uploader/clients/{$client->id}/reset-client-item-names",
-            ['all' => false],
-        )->assertStatus(422);
+        Sanctum::actingAs(User::factory()->create(['email' => 'r4-'.uniqid().'@example.com']));
+        $this->postJson('/api/review-uploader/clients/1/reset-client-item-names', ['all' => false])
+            ->assertStatus(422);
     }
 }
 ```
 
-- [ ] **Step 2: 테스트 실행 — 실패 확인**
-
-Run:
+실행 → 실패 확인:
 ```bash
 vendor/bin/phpunit --filter=ResetClientItemNamesTest
 ```
 
-Expected: 404 (route 없음) 또는 method not found
+- [ ] **Step 2: Controller 메서드 추가**
 
-- [ ] **Step 3: Controller 에 `resetClientItemNames` 메서드 추가**
-
-Append to `app/Http/Controllers/ReviewUploader/ReviewScanController.php` (use 구문 상단에 필요한 모델 추가):
+Edit `app/Http/Controllers/ReviewUploader/ReviewScanController.php` — use 구문 추가:
 
 ```php
 use App\Models\Review\ClientItem;
 use App\Models\Review\TargetItemMap;
 ```
 
-메서드 본문 (클래스 내부, 기존 메서드 뒤에 추가):
+클래스 내부에 메서드 추가:
 
 ```php
     /**
      * 자사몰 상품명 초기화
      *
-     * 선택된 매핑 (또는 전체) 의 연결 자사몰 상품에 대해 item_name=NULL,
-     * is_name_checked=0 으로 리셋한다. 수집 트리거는 하지 않는다.
-     *
-     * @urlParam clientId integer required 클라이언트 ID. Example: 1538
-     * @bodyParam map_ids array 선택 매핑 ID. all=true 면 무시. Example: [2362283, 2362284]
-     * @bodyParam all boolean 전체 모드. Example: false
-     *
-     * @response 200 {"success": true, "reset_count": 2}
+     * 선택 매핑 또는 전체 매핑의 연결 자사몰 상품에 대해
+     * item_name=NULL, is_name_checked=0 으로 리셋. 수집 트리거 없음.
      */
     public function resetClientItemNames(Request $request, int $clientId): JsonResponse
     {
@@ -794,81 +465,62 @@ use App\Models\Review\TargetItemMap;
         ]);
 
         if (!Client::find($clientId)) {
-            return response()->json([
-                'success' => false,
-                'error' => 'Client not found',
-            ], 404);
+            return response()->json(['success' => false, 'error' => 'Client not found'], 404);
         }
 
         $mapTable = (new TargetItemMap())->getTable();
-        $itemTable = (new ClientItem())->getTable();
 
-        $itemIdsQuery = ClientItem::query()
+        $query = ClientItem::query()
             ->where('client_id', $clientId)
             ->whereIn('item_code', function ($q) use ($mapTable, $clientId, $validated) {
-                $q->select('client_item_code')
-                  ->from($mapTable)
-                  ->where('client_id', $clientId);
+                $q->select('client_item_code')->from($mapTable)->where('client_id', $clientId);
                 if (empty($validated['all'])) {
                     $q->whereIn('id', $validated['map_ids']);
                 }
             });
 
         $total = 0;
-        $itemIdsQuery->chunkById(1000, function ($items) use (&$total, $itemTable) {
+        $query->chunkById(1000, function ($items) use (&$total) {
             $ids = $items->pluck('id')->all();
-            $total += \DB::table($itemTable)->whereIn('id', $ids)->update([
+            $total += ClientItem::whereIn('id', $ids)->update([
                 'item_name' => null,
                 'is_name_checked' => 0,
-                'updated_at' => now(),
             ]);
         });
 
-        return response()->json([
-            'success' => true,
-            'reset_count' => $total,
-        ]);
+        return response()->json(['success' => true, 'reset_count' => $total]);
     }
 ```
 
-- [ ] **Step 4: 라우트 등록**
+- [ ] **Step 3: 라우트 등록**
 
-Edit `routes/api.php`, Task 7 에서 수정한 `scan-client-items` 라우트 바로 아래에 추가 (두 구간 — :255 그룹, :402 그룹 둘 다):
+Edit `routes/api.php` — 기존 `scan-client-items` 라우트 (`:402` 및 `:255` 구간) 직후에 각각 추가:
 
 ```php
 Route::post('review-uploader/clients/{clientId}/reset-client-item-names', [ReviewScanController::class, 'resetClientItemNames']);
 ```
 
-- [ ] **Step 5: 테스트 실행 — 통과 확인**
+- [ ] **Step 4: 테스트 통과 + 커밋**
 
-Run:
 ```bash
 vendor/bin/phpunit --filter=ResetClientItemNamesTest
-```
-
-Expected: 4 passed
-
-- [ ] **Step 6: 커밋**
-
-```bash
 git add app/Http/Controllers/ReviewUploader/ReviewScanController.php routes/api.php tests/Feature/Review/ResetClientItemNamesTest.php
 git commit -m "feat(review-scan): 자사몰 상품명 초기화 API 추가
 
 POST /review-uploader/clients/{id}/reset-client-item-names
-선택 매핑 또는 전체 매핑 연결 자사몰 상품의 item_name/is_name_checked 리셋.
-placeholder 상품명 고착 해소용."
+client_id scope 에서 item_name=NULL, is_name_checked=0 리셋.
+chunkById(1000) 로 대량 처리, 다른 클라이언트 영향 없음."
 ```
 
 ---
 
-## Task 9: 프론트엔드 API 엔티티 확장
+## Task 4: 프론트엔드 — API 엔티티 + 버튼
 
 **Files:**
-- Modify: `SeoulVenturesGroupware/frontend/resources/ts/api/entities/review/clientItems.ts`
+- Modify `frontend/resources/ts/api/entities/review/clientItems.ts`
+- Modify `frontend/resources/ts/pages/review/data/index.vue` (L540-594 부근 핸들러, L1377 부근 template)
 
-현재 파일은 `get` import 만 하지만 POST 가 필요. `@/api` 의 `post` 도 import.
-
-- [ ] **Step 1: 파일 교체**
+- [ ] **Step 1: clientItems.ts 확장**
 
 Edit `frontend/resources/ts/api/entities/review/clientItems.ts` 전체 교체:
 
@@ -887,23 +539,17 @@ export interface ClientItem {
 
 export const clientItemsApi = {
   resolveProductNames: (clientId: number | string, opts?: { force?: boolean }): Promise<ApiResponse> =>
-    opts?.force
-      ? post(`/review-uploader/clients/${clientId}/scan-client-items`, { force: true })
-      : get(`/review-uploader/clients/${clientId}/scan-client-items`),
+    get(`/review-uploader/clients/${clientId}/scan-client-items`, opts?.force ? { force: 'true' } : undefined),
 
   resolveProductNamesByTargetItemMapIds: (
     clientId: number | string,
     targetItemMapIds: number[],
     opts?: { force?: boolean },
   ): Promise<ApiResponse> =>
-    opts?.force
-      ? post(`/review-uploader/clients/${clientId}/scan-client-items`, {
-          target_item_maps: targetItemMapIds.join(','),
-          force: true,
-        })
-      : get(`/review-uploader/clients/${clientId}/scan-client-items`, {
-          target_item_maps: targetItemMapIds.join(','),
-        }),
+    get(`/review-uploader/clients/${clientId}/scan-client-items`, {
+      target_item_maps: targetItemMapIds.join(','),
+      ...(opts?.force ? { force: 'true' } : {}),
+    }),
 
   resetProductNames: (clientId: number | string): Promise<ApiResponse> =>
     post(`/review-uploader/clients/${clientId}/reset-client-item-names`, { all: true }),
@@ -921,52 +567,20 @@ export const clientItemsApi = {
 export default clientItemsApi
 ```
 
-- [ ] **Step 2: 타입 체크**
+- [ ] **Step 2: index.vue 핸들러 4개 추가**
 
-Run:
-```bash
-cd frontend
-bun run typecheck 2>&1 | tail -20
-```
-
-Expected: 신규 API 관련 에러 없음 (기존 호출부는 1-인자 형태 그대로 — opts 가 optional 이므로 호환)
-
-- [ ] **Step 3: 커밋**
-
-```bash
-cd /opt/SeoulVentures/regle/SeoulVenturesGroupware
-git add frontend/resources/ts/api/entities/review/clientItems.ts
-git commit -m "feat(frontend): clientItemsApi 에 reset + force 옵션 추가"
-```
-
----
-
-## Task 10: `/review/data` 페이지에 버튼 4개 + 핸들러 추가
-
-**Files:**
-- Modify: `SeoulVenturesGroupware/frontend/resources/ts/pages/review/data/index.vue`
-
-기존 `resolveClientProductNames`, `resolveClientProductNamesForMappings` (line 540-594) 아래에 핸들러 4개 추가 + template 에 버튼 UI 추가.
-
-- [ ] **Step 1: 스크립트 섹션에 핸들러 4개 추가**
-
-`index.vue` 의 `<script setup>` 섹션, 기존 `resolveClientProductNamesForMappings` (line 594) 직후에 삽입:
+Edit `index.vue` L594 (`resolveClientProductNamesForMappings` 끝) 직후:
 
 ```typescript
 // 자사몰 상품명 초기화 - 전체
 const resetClientProductNames = () => {
-  if (!selectedClient.value?.id)
-    return
-
+  if (!selectedClient.value?.id) return
   showConfirm('전체 매핑의 자사몰 상품명을 초기화하시겠습니까? (item_name=NULL, is_name_checked=0)', async () => {
     try {
       const { success, reset_count } = await clientItemsApi.resetProductNames(selectedClient.value!.id)
-      if (success)
-        snackbar.success(`자사몰 상품명 ${reset_count}건 초기화됨.`)
-      else
-        snackbar.error('자사몰 상품명 초기화에 실패했습니다.')
-    }
-    catch (error) {
+      if (success) snackbar.success(`자사몰 상품명 ${reset_count}건 초기화됨.`)
+      else snackbar.error('자사몰 상품명 초기화에 실패했습니다.')
+    } catch (error) {
       handleError(error, { notificationMessage: '자사몰 상품명 초기화에 실패했습니다.' })
     }
   })
@@ -974,41 +588,28 @@ const resetClientProductNames = () => {
 
 // 자사몰 상품명 초기화 - 선택된 매핑
 const resetClientProductNamesForMappings = () => {
-  if (!selectedClient.value?.id || selectedMappings.value.length === 0)
-    return
-
+  if (!selectedClient.value?.id || selectedMappings.value.length === 0) return
   showConfirm(`선택된 ${selectedMappings.value.length}건 매핑의 자사몰 상품명을 초기화하시겠습니까?`, async () => {
     try {
       const mappingIds = selectedMappings.value.map(m => m.id)
-      const { success, reset_count } = await clientItemsApi.resetProductNamesByTargetItemMapIds(
-        selectedClient.value!.id,
-        mappingIds,
-      )
-      if (success)
-        snackbar.success(`자사몰 상품명 ${reset_count}건 초기화됨.`)
-      else
-        snackbar.error('자사몰 상품명 초기화에 실패했습니다.')
-    }
-    catch (error) {
+      const { success, reset_count } = await clientItemsApi.resetProductNamesByTargetItemMapIds(selectedClient.value!.id, mappingIds)
+      if (success) snackbar.success(`자사몰 상품명 ${reset_count}건 초기화됨.`)
+      else snackbar.error('자사몰 상품명 초기화에 실패했습니다.')
+    } catch (error) {
       handleError(error, { notificationMessage: '자사몰 상품명 초기화에 실패했습니다.' })
     }
   })
 }
 
-// 자사몰 상품명 강제 수집 - 전체 (force=true)
+// 자사몰 상품명 강제 수집 - 전체
 const forceResolveClientProductNames = () => {
-  if (!selectedClient.value?.id)
-    return
-
+  if (!selectedClient.value?.id) return
   showConfirm('전체 매핑의 자사몰 상품명 강제 수집을 요청하시겠습니까? (기존 값 덮어씀)', async () => {
     try {
       const { success } = await clientItemsApi.resolveProductNames(selectedClient.value!.id, { force: true })
-      if (success)
-        snackbar.success('자사몰 상품명 강제 수집이 요청되었습니다. 완료 시 슬랙으로 알려드립니다.')
-      else
-        snackbar.error('자사몰 상품명 강제 수집 요청에 실패했습니다.')
-    }
-    catch (error) {
+      if (success) snackbar.success('자사몰 상품명 강제 수집이 요청되었습니다. 완료 시 슬랙으로 알려드립니다.')
+      else snackbar.error('자사몰 상품명 강제 수집 요청에 실패했습니다.')
+    } catch (error) {
       handleError(error, { notificationMessage: MSG_PRODUCT_NAME_COLLECT_FAILED })
     }
   })
@@ -1016,47 +617,33 @@ const forceResolveClientProductNames = () => {
 
 // 자사몰 상품명 강제 수집 - 선택된 매핑
 const forceResolveClientProductNamesForMappings = () => {
-  if (!selectedClient.value?.id || selectedMappings.value.length === 0)
-    return
-
+  if (!selectedClient.value?.id || selectedMappings.value.length === 0) return
   showConfirm(`선택된 ${selectedMappings.value.length}건 매핑의 자사몰 상품명 강제 수집을 요청하시겠습니까? (기존 값 덮어씀)`, async () => {
     try {
       const mappingIds = selectedMappings.value.map(m => m.id)
-      const { success } = await clientItemsApi.resolveProductNamesByTargetItemMapIds(
-        selectedClient.value!.id,
-        mappingIds,
-        { force: true },
-      )
-      if (success)
-        snackbar.success('선택된 매핑의 자사몰 상품명 강제 수집이 요청되었습니다.')
-      else
-        snackbar.error('자사몰 상품명 강제 수집 요청에 실패했습니다.')
-    }
-    catch (error) {
+      const { success } = await clientItemsApi.resolveProductNamesByTargetItemMapIds(selectedClient.value!.id, mappingIds, { force: true })
+      if (success) snackbar.success('선택된 매핑의 자사몰 상품명 강제 수집이 요청되었습니다.')
+      else snackbar.error('자사몰 상품명 강제 수집 요청에 실패했습니다.')
+    } catch (error) {
       handleError(error, { notificationMessage: MSG_PRODUCT_NAME_COLLECT_FAILED })
     }
   })
 }
 ```
 
-- [ ] **Step 2: 템플릿에 버튼 UI 추가**
-
-`index.vue` 의 template 섹션에서 기존 `resolveClientProductNames` 를 호출하는 버튼을 찾고, 같은 툴바 그룹에 버튼 4개를 추가. 예시 (기존 버튼 배치를 따라 Vuetify `VBtn` 사용):
+- [ ] **Step 3: 템플릿 버튼 추가** — `index.vue:1377` 근처의 기존 `<VListItem @click="resolveClientProductNames">` 가 포함된 `VMenu` 를 확인 후, 동일 툴바 그룹에 신규 `VMenu` 2개 삽입. 예:
 
 ```vue
-<!-- 기존 "자사몰 상품명 수집" 버튼 옆에 추가 -->
+<!-- 기존 '자사몰 상품명 수집' VMenu 옆에 추가 -->
 
 <VMenu>
-  <template #activator="{ props }">
-    <VBtn v-bind="props" variant="outlined" prepend-icon="mdi-restore" :disabled="!selectedClient">
+  <template #activator="{ props: activatorProps }">
+    <VBtn v-bind="activatorProps" variant="outlined" prepend-icon="mdi-restore" :disabled="!selectedClient">
       자사몰 상품명 초기화
     </VBtn>
   </template>
   <VList>
-    <VListItem
-      :disabled="selectedMappings.length === 0"
-      @click="resetClientProductNamesForMappings"
-    >
+    <VListItem :disabled="selectedMappings.length === 0" @click="resetClientProductNamesForMappings">
       <VListItemTitle>선택된 {{ selectedMappings.length }}건</VListItemTitle>
     </VListItem>
     <VListItem @click="resetClientProductNames">
@@ -1066,16 +653,13 @@ const forceResolveClientProductNamesForMappings = () => {
 </VMenu>
 
 <VMenu>
-  <template #activator="{ props }">
-    <VBtn v-bind="props" variant="outlined" color="warning" prepend-icon="mdi-reload-alert" :disabled="!selectedClient">
+  <template #activator="{ props: activatorProps }">
+    <VBtn v-bind="activatorProps" variant="outlined" color="warning" prepend-icon="mdi-reload-alert" :disabled="!selectedClient">
       자사몰 상품명 강제 수집
     </VBtn>
   </template>
   <VList>
-    <VListItem
-      :disabled="selectedMappings.length === 0"
-      @click="forceResolveClientProductNamesForMappings"
-    >
+    <VListItem :disabled="selectedMappings.length === 0" @click="forceResolveClientProductNamesForMappings">
       <VListItemTitle>선택된 {{ selectedMappings.length }}건</VListItemTitle>
     </VListItem>
     <VListItem @click="forceResolveClientProductNames">
@@ -1085,214 +669,101 @@ const forceResolveClientProductNamesForMappings = () => {
 </VMenu>
 ```
 
-**주의**: 실제 아이콘명과 툴바 래퍼 (`VBtnGroup`, `VToolbarItems`, `VRow` 등) 는 기존 `resolveClientProductNames` 버튼의 주변 마크업을 따른다. 주변 구조에 맞게 감싸기만 통일.
+- [ ] **Step 4: 린트/타입/스모크 + 커밋**
 
-- [ ] **Step 3: 린트 + 타입체크**
-
-Run:
-```bash
-cd frontend
-bun run lint
-bun run typecheck 2>&1 | tail -30
-```
-
-Expected: 에러 없음
-
-- [ ] **Step 4: 개발 서버 스모크 테스트**
-
-Run (별도 터미널 권장):
-```bash
-cd frontend
-bun run dev
-```
-
-브라우저에서 `/review/data` 로 접속, 클라이언트 선택 후:
-- 새 버튼 2개 노출 확인
-- 드롭다운에 "선택된 N건" / "전체 매핑" 2개 옵션
-- 선택 모드는 체크박스 0건 시 disabled
-- 클라이언트 미선택 시 두 버튼 disabled
-
-- [ ] **Step 5: 커밋**
-
-```bash
-cd /opt/SeoulVentures/regle/SeoulVenturesGroupware
-git add frontend/resources/ts/pages/review/data/index.vue
-git commit -m "feat(review-data): 자사몰 상품명 초기화·강제수집 버튼 추가
-
-선택/전체 모드 드롭다운. 초기화는 DB 리셋 (수집 트리거 없음),
-강제 수집은 force=true 로 is_name_checked 무시하고 덮어쓰기."
-```
-
----
-
-## Task 11: SVGW 전체 테스트 스위트
-
-- [ ] **Step 1: PHPUnit 전체**
-
-Run:
-```bash
-cd /opt/SeoulVentures/regle/SeoulVenturesGroupware
-vendor/bin/phpunit --filter="Review"
-```
-
-Expected: 신규 2 class 포함 전부 통과
-
-- [ ] **Step 2: PHPUnit 기존 회귀**
-
-Run:
-```bash
-vendor/bin/phpunit
-```
-
-Expected: 기존 테스트 전부 통과
-
-- [ ] **Step 3: 프론트 typecheck + lint**
-
-Run:
 ```bash
 cd frontend
 bun run typecheck && bun run lint
+bun run dev  # 별도 터미널 — 브라우저에서 버튼 4경로 동작 확인
 ```
 
-Expected: 0 error
+스모크 체크리스트:
+- 클라이언트 미선택 시 두 신규 버튼 disabled
+- 체크박스 0건 시 "선택된 N건" disabled
+- 각 경로 클릭 → confirm dialog → snackbar 정상
+
+```bash
+cd ..
+git add frontend/resources/ts/api/entities/review/clientItems.ts frontend/resources/ts/pages/review/data/index.vue
+git commit -m "feat(review-data): 자사몰 상품명 초기화·강제수집 버튼 추가
+
+선택/전체 모드 드롭다운. 초기화=DB 리셋, 강제수집=force=true 로
+is_name_checked 우회."
+```
 
 ---
 
-## Task 12: SVGW Draft PR 생성
+## Task 5: SVGW PR 생성
 
-- [ ] **Step 1: 푸시**
+- [ ] **Step 1: 전체 테스트 + 푸시**
 
-Run:
 ```bash
-cd /opt/SeoulVentures/regle/SeoulVenturesGroupware
+vendor/bin/phpunit --filter="Review"
 git push -u origin feature/review-data-item-name-reset-force
 ```
 
-- [ ] **Step 2: Draft PR 생성**
+- [ ] **Step 2: Draft PR**
 
-Run:
 ```bash
 gh pr create --draft \
   --title "feat(review-data): 자사몰 상품명 초기화·강제수집 버튼 추가" \
-  --body "$(cat <<'EOF'
-## Summary
-- `/review/data` 페이지에 버튼 2개 추가: 자사몰 상품명 초기화 / 강제 수집
-- 각 버튼 드롭다운으로 "선택된 N건" / "전체 매핑" 모드 제공
-- 초기화: `item_name=NULL, is_name_checked=0` 리셋만 (수집 트리거 없음)
-- 강제 수집: 기존 `scan-client-items` 엔드포인트에 `force=true` 전달 → regle 워커가 `is_name_checked` 무시하고 덮어쓰기
+  --body "## Summary
+- /review/data 에 버튼 2개: 자사몰 상품명 초기화 / 강제 수집 (선택·전체 드롭다운)
+- 초기화: item_name=NULL, is_name_checked=0 리셋만
+- 강제 수집: 기존 scan-client-items 에 force=true → regle 워커 --force
 
 ## Depends on
-- regle PR: <regle PR URL — Task 5 Step 3 에서 기록한 URL>
-- 위 PR 이 prod 에 배포되어 있어야 `force=true` 가 실제 강제수집 동작함 (구버전 regle 은 `--force` 무시)
+- regle PR: <Task 1 Step 5 에서 기록한 URL>
+- regle 이 먼저 prod 배포되어야 --force 실효 (구버전은 unknown option 거부 가능)
 
 ## Spec
-regle/docs/superpowers/specs/2026-04-15-review-data-item-name-buttons-design.md
+regle 메인 repo docs/superpowers/specs/2026-04-15-review-data-item-name-buttons-design.md
 
-## 배경
-바닐라코 client_id=1538 의 자사몰 상품 item_code=1177 이 `item_name='바닐라닷컴'`, `is_name_checked=1` 로 고착. 기존 수집 버튼은 `is_name_checked=True` 이면 스킵. 운영자 복구 수단 부재.
-
-## 변경 내역
-### 백엔드
-- `RegleEcsService::scanClientItems` 에 `bool $force` 파라미터 추가 (default false)
-- `ReviewScanController::scanClientItems` 가 request `force` 파싱 → service 전달
-- `ReviewScanController::resetClientItemNames` 신규 (POST)
-- `routes/api.php`: scan 라우트 POST 허용 + reset 라우트 신규 등록
-
-### 프론트엔드
-- `clientItemsApi` 에 `resetProductNames`, `resetProductNamesByTargetItemMapIds` 추가
-- `resolveProductNames` / `resolveProductNamesByTargetItemMapIds` 에 `{ force?: boolean }` optional 옵션 추가 (기존 호출부 호환)
-- `/review/data` 페이지 index.vue 에 버튼 2개 + 핸들러 4개
-
-### 마이그레이션
-없음
+## 변경
+- RegleEcsService: buildArgs bool 지원 + scanClientItems(\$force)
+- ReviewScanController: scanClientItems query force + resetClientItemNames 신규
+- routes: reset 라우트 POST 등록 (2 구간)
+- frontend clientItemsApi: force 옵션 + reset 메서드
+- index.vue: 핸들러 4개 + 드롭다운 VMenu 2개
 
 ## Test plan
-- [x] PHPUnit `ResetClientItemNamesTest` (4 cases) 통과
-- [x] PHPUnit `ForceScanClientItemsTest` (2 cases) 통과
-- [x] PHPUnit 기존 스위트 회귀 없음
-- [x] 프론트 typecheck / lint 통과
-- [ ] 개발 서버에서 버튼 동작 스모크 (클라이언트 선택/미선택, 체크박스 0건/N건 × 4경로 + 초기화 후 실제 DB 리셋 확인 + 강제수집 ECS RunTask 발사 확인)
-- [ ] regle PR 머지 + 이미지 배포 후 staging 에서 end-to-end 1회 (바닐라코 1538 / item_code=1177 실제 복구 시나리오)
+- [x] ResetClientItemNamesTest (4 cases)
+- [x] 기존 phpunit 회귀
+- [x] 프론트 typecheck + lint
+- [ ] staging 스모크 (바닐라코 1538 / item_code=1177 시나리오)
 
-## 배포 순서
-1. regle PR 머지 → ECS 이미지 빌드 완료 확인 (`aws ecs describe-task-definition` 로 신규 revision)
-2. 이 PR ready for review → 머지
-3. SVGW prod 배포: gh release create 시 `--target "$(git ls-remote <repo> refs/heads/master | awk '{print $1}')" v<x.y.z>` (SHA 명시)
-4. 직후 `git ls-remote <repo> refs/tags/v<x.y.z>` 로 master HEAD 와 일치 확인
-EOF
-)"
+## 배포
+1. regle PR 머지 → ECS 이미지 빌드 (revision 증가 확인)
+2. 이 PR ready → 머지
+3. gh release create --target \"\$(git ls-remote <repo> refs/heads/master | awk '{print \$1}')\" v<x.y.z>
+4. git ls-remote <repo> refs/tags/v<x.y.z> 로 SHA 일치 확인"
 ```
-
-- [ ] **Step 3: PR URL 기록**
 
 ---
 
-## Task 13: 스테이징/프로덕션 검증 (사용자 승인 후)
+## Task 6: Staging 검증 (사용자 승인 후)
 
-- [ ] **Step 1: regle PR + SVGW PR 모두 승인/머지**
-
-- [ ] **Step 2: staging 배포 확인**
-
-Run:
-```bash
-gh run list --workflow=deploy.yml --limit=3
-```
-
-- [ ] **Step 3: 바닐라코 1538 / item_code=1177 실제 복구 시나리오**
-
-1. `/review/data` 접속, 클라이언트 `바닐라코` 선택
-2. item_code=1177 매핑 2건 체크
-3. "자사몰 상품명 초기화" → "선택된 2건" 클릭 → snackbar `2건 초기화됨`
-4. DB 확인:
-   ```bash
-   cd /opt/SeoulVentures/regle/review-moai-refactoring
-   .venv/bin/python -c "
-   import os, pymysql
-   from dotenv import load_dotenv
-   load_dotenv()
-   c = pymysql.connect(host=os.getenv('MYSQL_HOST'), user=os.getenv('MYSQL_USER'),
-       password=os.getenv('MYSQL_PASSWD'), database=os.getenv('MYSQL_DATABASE'),
-       port=int(os.getenv('MYSQL_PORT')), charset='utf8mb4')
-   with c.cursor() as cur:
-       cur.execute(\"SELECT item_name, is_name_checked FROM review_client_items WHERE client_id=1538 AND item_code='1177'\")
-       print(cur.fetchall())
-   "
-   ```
-   Expected: `((None, 0),)`
-5. "자사몰 상품명 강제 수집" → "선택된 2건" 클릭 → snackbar `강제 수집이 요청되었습니다`
-6. CloudWatch `/ecs/regle-worker-cli-production` 로그:
-   ```bash
-   NOW=$(date +%s)000
-   START=$(( $(date -d '10 minutes ago' +%s) * 1000 ))
-   aws logs filter-log-events --log-group-name /ecs/regle-worker-cli-production \
-     --region ap-northeast-2 --start-time $START --end-time $NOW \
-     --filter-pattern '"force=True"' --max-items 5 \
-     --query 'events[].message' --output text
-   ```
-   Expected: `상품 스캔을 시작합니다.1538 force=True` 로그 확인
-7. 5-10분 후 DB 재확인 → `item_name` 이 실제 자사몰 상품명으로 채워졌거나 (URL 패턴 수정 필요 시 여전히 실패 — 후속 이슈 범위)
-
-- [ ] **Step 4: 메모리 업데이트**
-
-`/opt/SeoulVentures/.claude/projects/-opt-SeoulVentures-regle/memory/` 에 이번 작업 결과 기록:
-- `review-data-item-name-buttons-2026-04-15.md` 신규 (작업 요약, 교훈)
-- `MEMORY.md` 에 한 줄 추가
-
-- [ ] **Step 5: 후속 이슈 발행** (사용자 승인 후)
-
-- `review-moai-refactoring`: `review_clients.product_url_pattern` 과 실제 `item_url` 형식 불일치 검증 로직
-- `review-moai-refactoring`: 올리브영 403 우회 전략 (UA/프록시)
-- SVGW: `review_clients.upload_driver_config` / `Authorization` NULL 상태 감지 & 알림 (크리마 업로드 설정 결손 대응)
+- [ ] PR 머지 + 배포 완료 확인
+- [ ] `/review/data` 에서 바닐라코 선택 → item_code=1177 매핑 체크 → 초기화 → DB 에서 `item_name=NULL, is_name_checked=0` 직접 쿼리로 확인
+- [ ] 강제 수집 → CloudWatch `/ecs/regle-worker-cli-production` 에서 `force=True` 로그 확인 → 5-10분 후 DB 재확인
+- [ ] 메모리 업데이트 (`memory/MEMORY.md` 에 한 줄)
 
 ---
 
-## Self-Review 체크리스트 (구현자용)
+## Follow-up (플랜 범위 외, 별도 이슈)
 
-- [ ] 스펙의 모든 요구 (초기화 선택/전체, 강제수집 선택/전체) 가 태스크로 매핑됨 — Task 1-13
-- [ ] regle `flag_force` default False 로 기존 호출부 회귀 없음 — Task 2 Step 3 에서 전체 pytest
-- [ ] SVGW `scanClientItems` 기존 GET 호출부 호환 — Task 7 Step 1 의 두 번째 테스트
-- [ ] 프론트 `resolveProductNames` 기존 1-인자 호출부 호환 — `opts` 가 optional
-- [ ] `(new Model())->getTable()` 사용 — Task 8 Step 3
-- [ ] `chunkById(1000)` 사용 — Task 8 Step 3
-- [ ] 클라이언트 scope 격리 — Task 8 Step 1 세 번째 테스트로 보증
-- [ ] gh release SHA 명시 — Task 12 Step 2 PR body 에 명시
+- review-moai: `review_clients.product_url_pattern` vs 실제 `item_url` 형식 불일치 검증 (바닐라코 루트 원인)
+- review-moai: 올리브영 403 우회
+- SVGW: `review_clients.upload_driver_config` / `Authorization` NULL 감지 & 알림
+
+---
+
+## Self-Review 체크리스트
+
+- [ ] 스펙 4개 축 (초기화·강제수집 × 선택·전체) 모두 Task 매핑
+- [ ] regle `flag_force` default False → 기존 호출부 회귀 없음 (Task 1 Step 4)
+- [ ] SVGW 기존 `resolveProductNames` (GET 1-인자) 호출부 호환 — `opts` optional
+- [ ] `(new Model())->getTable()` + `chunkById` (Task 3 Step 2)
+- [ ] Client scope 격리 테스트 (Task 3 Step 1 `test_reset_does_not_touch_other_clients`)
+- [ ] gh release SHA 명시 (Task 5 Step 2 PR body)
+- [ ] Phase Gate 로 regle → SVGW 배포 순서 강제

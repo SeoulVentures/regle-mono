@@ -46,7 +46,7 @@ POST /api/review/clients/{client}/upload-history/archive
 ```
 
 - 매핑 독립 (클라이언트 단위 라우트)
-- 기존 `Route::prefix('review')->middleware('auth')->group(...)` 내부
+- 기존 `Route::middleware('auth:sanctum')->group(...)` 내부의 `Route::prefix('review')->group(...)` 하위에 추가 (`routes/api.php:86` 구조)
 - 추가 미들웨어: `throttle:60,1` (사용자 스코프 — Laravel 기본 key 는 로그인 시 user-id, 미로그인 시 IP). 분당 60 호출 제한. 평균 10 매핑 × 20 chunk ≈ 200 회 요청을 3.3 분에 수용. 멀티 운영자는 각자 60/분 여유 (상호 간섭 없음).
 
 ### Request
@@ -56,12 +56,15 @@ POST /api/review/clients/{client}/upload-history/archive
   "config_id": 42,
   "target_item_code": "4995740052",
   "client_item_code": "189",
-  "confirm_text": "위험성을 알고 동의합니다",
-  "mapping_batch_id": "550e8400-e29b-41d4-a716-446655440000"
+  "confirm_text": "위험성을 알고 동의합니다"
 }
 ```
 
-- `mapping_batch_id`: **프론트가 매핑 처리 시작 시 1회 생성한 UUID v4**. 같은 매핑의 모든 chunk 호출에 동일한 값을 전달. 감사 관점에서 "운영자 1회 실행" 을 묶는 용도 (S-4 해결). chunk 당이 아니라 매핑 단위.
+- **`mapping_batch_id` 는 request 에 포함하지 않는다 (서버 주도)**.
+  - 서버가 첫 chunk 진입 시 UUID v4 를 생성하여 Redis `Cache::put("upload-history-batch:{client_id}:{config_id}:{target_item_code}:{client_item_code}", $uuid, 600)` 에 10분 TTL 로 저장
+  - 후속 chunk 호출은 cache 에서 재조회 (없으면 신규 UUID — 새 "세션" 으로 간주)
+  - 클라이언트 통제 값이 아니므로 감사 추적 신뢰성 보장 (임의 UUID 주입 불가)
+  - Response 에서 echo 해 프론트 정합성 확인 가능
 
 **`config_id` 를 URL 이 아닌 body 에 두는 이유** (S-7):
 - URL 에 올리면 삭제된 config 접근이 route model binding 에 의해 404 → 운영자가 "원인 불명 실패" 로 혼란
@@ -72,8 +75,7 @@ POST /api/review/clients/{client}/upload-history/archive
 - `config_id`: `integer|min:1`, `DriverConfig::find($config_id)->client_id === client->id` (cross-client 공격 방어)
 - `target_item_code`: `string|min:1`
 - `client_item_code`: `string|min:1`
-- `confirm_text`: trim + NFC 정규화 후 `위험성을 알고 동의합니다` 정확 일치 — `ClientNameComparator::equals()` **재사용** (신규 클래스 X)
-- `mapping_batch_id`: `string|uuid`
+- `confirm_text`: trim + NFC 정규화 후 `위험성을 알고 동의합니다` 정확 일치 — `ClientNameComparator::equals()` **재사용** (신규 클래스 X). 호출부는 `UploadHistoryController::confirmTokenMatches(string $input): bool` 래퍼 private 메서드로 의도 명시 (S-1)
 - `driver_code`: 서버가 `DriverConfig` 에서 도출 (클라이언트 입력 불허)
 - `target_database_hive`: 서버가 `Client` 에서 도출 (클라이언트 입력 불허)
 
@@ -132,6 +134,38 @@ state 무관 (ready / failed / finished 모두).
 분산 락 → find → insertMany (duplicate key 허용) → deleteMany 순. 각 단계의 실패가 재호출 시 안전하게 수렴하도록 설계.
 
 ```php
+// === Controller: UploadHistoryController::archive() ===
+public function archive(Client $client, Request $request): JsonResponse
+{
+    $validated = $request->validate([...]);
+    // ... (a) Client 이미 바인딩, (b) DriverConfig 조회, (c) TargetItemMap 조회
+    $driverConfig = DriverConfig::findOrFail($validated['config_id']);
+    abort_if($driverConfig->client_id !== $client->id, 422, '드라이버 설정이 ...');
+    $archivedMappingId = TargetItemMap::query()
+        ->where('client_id', $client->id)
+        ->where('config_id', $validated['config_id'])
+        ->where('target_item_code', $validated['target_item_code'])
+        ->where('client_item_code', $validated['client_item_code'])
+        ->value('id');
+
+    try {
+        $result = $this->service->archiveChunk(
+            $client,
+            $validated['config_id'],
+            $driverConfig->driver_code,
+            $validated['target_item_code'],
+            $validated['client_item_code'],
+            Auth::user()->email ?? 'unknown',
+            $archivedMappingId,
+        );
+    } catch (UploadHistoryLockedException $e) {
+        return response()->json(['message' => '같은 매핑에 대한 아카이브 작업이 이미 진행 중입니다. 잠시 후 재시도하세요.'], 423);
+    }
+
+    return response()->json($result);
+}
+
+// === Service: UploadHistoryArchiveService::archiveChunk() ===
 const CHUNK_SIZE = 500;
 
 // 1. 분산 락 획득 (C-2 방어)
@@ -149,23 +183,38 @@ if (! $lock->get()) {
     Log::warning('[upload-history] lock contention', [
         'client_id' => $client->id, 'config_id' => $configId,
         'target_item_code' => $targetItemCode, 'client_item_code' => $clientItemCode,
-        'mapping_batch_id' => $mappingBatchId, 'archived_by' => $archivedBy,
+        'archived_by' => $archivedBy,
     ]);
-    return response()->json([
-        'message' => '같은 매핑에 대한 아카이브 작업이 이미 진행 중입니다. 잠시 후 재시도하세요.',
-    ], 423);
+    throw new UploadHistoryLockedException; // 컨트롤러가 423 으로 변환
 }
 
 try {
-    // 2. MongoDB 연결 — CLAUDE.md: getClient() / table() 사용
+    // 2. mapping_batch_id — Redis 에서 재사용 또는 신규 발급 (I-5, 서버 주도)
+    $batchCacheKey = sprintf('upload-history-batch:%d:%d:%s:%s',
+        $client->id, $configId, $targetItemCode, $clientItemCode);
+    $mappingBatchId = Cache::remember(
+        $batchCacheKey,
+        600, // 10분 TTL — 한 매핑 처리가 끝날 시간 여유
+        fn() => (string) Str::uuid()
+    );
+
+    // 3. MongoDB 연결 — CLAUDE.md: getClient() / table() 사용
     $conn = DB::connection('mongodb');
     $db = $conn->getClient()->selectDatabase($client->target_database_hive);
     $coll = $db->selectCollection('review_upload_target_list');
     $archiveColl = $db->selectCollection('review_upload_target_list_archive');
 
-    // 3. 청크 조회
+    // 4. 런타임 인덱스 보장 (I-4/S-4) — 신규 hive 에서도 유니크 인덱스 보장
+    //    같은 이름/스펙 재생성은 MongoDB 가 no-op 처리 (비용 미미)
+    $archiveColl->createIndex(
+        ['original_id' => 1],
+        ['unique' => true, 'name' => 'uniq_original_id']
+    );
+
+    // 5. 청크 조회
     $docs = iterator_to_array($coll->find($filter, ['limit' => self::CHUNK_SIZE]), false);
     if (empty($docs)) {
+        Cache::forget($batchCacheKey); // 배치 종료 — 다음 실행은 신규 UUID
         return [
             'archived_count' => 0, 'duplicate_count' => 0,
             'remaining_count' => 0, 'has_more' => false,
@@ -173,7 +222,7 @@ try {
         ];
     }
 
-    // 4. 메타 추가
+    // 6. 메타 추가
     $archivedAt = new UTCDateTime();
     $originalIds = [];
     foreach ($docs as &$doc) {
@@ -187,7 +236,7 @@ try {
     }
     unset($doc);
 
-    // 5. archive insertMany — ordered:false + code 11000 허용 (C-1 해결)
+    // 7. archive insertMany — ordered:false + code 11000 허용 (C-1 해결)
     $duplicateCount = 0;
     $insertedCount = count($docs);
     try {
@@ -208,11 +257,16 @@ try {
             : count($docs) - $duplicateCount;
     }
 
-    // 6. 원본 deleteMany — archive 완료(신규 or duplicate 둘 다) 보장된 _id 들 제거
+    // 8. 원본 deleteMany — archive 완료(신규 or duplicate 둘 다) 보장된 _id 들 제거
     $coll->deleteMany(['_id' => ['$in' => $originalIds]]);
 
-    // 7. remaining_count — 매 호출 집계 (I-2 단정)
+    // 9. remaining_count — 매 호출 집계 (I-2 단정)
     $remainingCount = $coll->countDocuments($filter);
+
+    // 10. 완료 시 batch cache 정리 (다음 실행은 신규 UUID)
+    if ($remainingCount === 0) {
+        Cache::forget($batchCacheKey);
+    }
 
     return [
         'archived_count' => $insertedCount,
@@ -225,6 +279,10 @@ try {
     optional($lock)->release();
 }
 ```
+
+**불변식**: `archived_count + duplicate_count === 이번 chunk 에서 MongoDB 가 반환한 문서 수 (최대 CHUNK_SIZE)`. 테스트 assertion 으로 활용 (S-3).
+
+**`insertMany` vs `upsert` 선택 이유**: upsert 는 기존 archive 문서를 업데이트해 **최초 archive 시점 메타 (archived_at, archived_by) 손실** 위험. `insertMany(ordered:false)` + code 11000 허용은 "최초 기록만 유지, 중복 차단" 을 자연히 달성 (S-2 정당화).
 
 **컨트롤러 진입 시 1회 조회 (I-4 해결)**:
 
@@ -280,7 +338,7 @@ return new class extends Migration
 | `archived_at` | UTCDateTime | 이동 시점 |
 | `archived_by` | string | 실행자 email |
 | `archived_mapping_id` | int \| null | 실행 시점의 `TargetItemMap.id` (삭제된 매핑이면 null) |
-| `archive_batch_id` | string (UUID v4) | 이번 호출 배치 ID |
+| `archive_batch_id` | string (UUID v4) | 매핑 단위 배치 ID (API 에서는 `mapping_batch_id` 로 echo — 두 이름은 같은 값, 관점 구분: API 는 "매핑 처리 배치", 저장소는 "아카이브 배치") |
 
 **인덱스**:
 - `{original_id: 1}` **유니크 인덱스** 필수 (C-1 멱등성 방어). 한 번 archive 된 원본은 동일 `original_id` 로 다시 들어오지 않으며, 재호출 시 duplicate key (code 11000) 로 차단됨.
@@ -392,17 +450,24 @@ async function executeArchive(selected: TargetItemMap[]) {
     let total: number | null = null
     let finalStatus: ArchiveResult['status'] = 'cancelled'
     let errorMessage: string | undefined
-    const mappingBatchId = crypto.randomUUID() // 매핑 단위 1회 생성 (S-4)
+    // mapping_batch_id 는 서버가 발급 (I-5). 프론트는 응답의 mapping_batch_id 로 추적만.
 
     try {
       while (true) {
-        const res = await archiveUploadHistory(m.client_id, {
-          config_id: m.config_id,
-          target_item_code: m.target_item_code,
-          client_item_code: m.client_item_code,
-          confirm_text: '위험성을 알고 동의합니다',
-          mapping_batch_id: mappingBatchId,
-        })
+        let res
+        try {
+          res = await archiveUploadHistory(m.client_id, {
+            config_id: m.config_id,
+            target_item_code: m.target_item_code,
+            client_item_code: m.client_item_code,
+            confirm_text: '위험성을 알고 동의합니다',
+          })
+        } catch (e) {
+          // C-2 해결: 네트워크/HTTP 에러는 error 로 기록 (silent cancelled 금지)
+          finalStatus = 'error'
+          errorMessage = (e as Error).message ?? 'network error'
+          break
+        }
 
         if (!res.success) {
           finalStatus = 'error'
@@ -443,7 +508,7 @@ async function executeArchive(selected: TargetItemMap[]) {
       }
     }
 
-    // 외부 루프는 break 하지 않는다 — 다음 iteration 에서 L321 분기로 남은 매핑이 skipped 기록
+    // 외부 루프는 break 하지 않는다 — 다음 iteration 에서 앞부분의 `cancelled.value` 가드가 남은 매핑을 skipped 기록
   }
 
   showSummary(results, cancelled.value)
@@ -479,8 +544,9 @@ Log::info('[upload-history] archive chunk', [
     'archived_by' => $archivedBy,
 ]);
 
-// 락 획득 실패는 별도 Log::warning 으로 위에서 기록 (self-review 대응)
+// 락 획득 실패는 별도 Log::warning 으로 위에서 기록
 // Rate limit 초과 (429) 는 Laravel throttle 미들웨어가 자체 로깅
+// 0건 chunk (has_more=false, archived_count=0) 도 위 Log::info 로 기록 — 컨트롤러가 서비스 반환 직후 호출 (S-6)
 ```
 
 MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존). 애플리케이션 로그는 보조.
@@ -507,19 +573,22 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
 ### 테스트
 
 - `tests/Feature/Review/ArchiveUploadHistoryTest.php`
-  - 정상 흐름 (단일 chunk, 멀티 chunk)
+  - 정상 흐름 (단일 chunk, 멀티 chunk) — 응답에 `mapping_batch_id` (서버 생성 UUID) 포함 검증
   - 토큰 불일치 → 422
   - cross-client config_id → 422
   - 매핑이 삭제된 상태 (mapping_id null) 에서도 archive 동작
-  - 0건 요청 (has_more=false, archived_count=0) 멱등
-  - **재호출 멱등성**: 같은 원본을 두 번째 호출 시 archive 유니크 인덱스가 duplicate key 로 차단, 원본 deleteMany 만 실행됨
+  - 0건 요청 (has_more=false, archived_count=0, duplicate_count=0) 멱등
+  - **재호출 멱등성**: 같은 원본을 두 번째 호출 시 **응답의 `duplicate_count === 500` 이고 `archived_count === 0`** 검증 (C-1 방어 발동 관측, I-3)
+  - **`mapping_batch_id` 재사용**: 같은 튜플의 연속 chunk 호출에서 응답 `mapping_batch_id` 동일값 유지. `Cache::flush` 후 재호출 시 신규 UUID
   - **분산 락**: 같은 튜플에 락이 이미 걸려있으면 423 Locked (Cache::lock 을 mock 또는 실제 Redis 사용)
   - **Rate limit**: 분당 60+1 호출 시 429 반환
 - `tests/Unit/Services/Review/UploadHistoryArchiveServiceTest.php`
   - chunk size 경계 (정확히 500, 501, 1000)
-  - 아카이브 도큐먼트 메타 필드 검증
-  - `archived_mapping_id` 가 서비스 호출 1회당 MySQL 재조회 없이 파라미터로 전달되는지 검증
+  - 아카이브 도큐먼트 메타 필드 검증 (`original_id`, `archived_at`, `archived_by`, `archived_mapping_id`, `archive_batch_id`)
+  - `archived_mapping_id` / `driver_code` 가 서비스 호출 1회당 MySQL 재조회 없이 파라미터로 전달되는지 검증
   - `BulkWriteException` 중 code 11000 만 허용, 다른 에러는 전파됨을 검증
+  - 불변식 `archived_count + duplicate_count === 조회 건수 (최대 CHUNK_SIZE)` 검증 (S-3)
+  - 런타임 `createIndex` idempotent 호출 검증 (I-4)
 
 ## 엣지 케이스
 
@@ -554,6 +623,8 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
 
 ### E7. HTTP 타임아웃
 - chunk 500 + countDocuments 1회 = 수백 ms 예상 (필터 인덱스 존재 시). 일반 타임아웃 내.
+- **대형 hive 주의**: 필터 인덱스 부재 + 누적 100만 건+ 의 hive 에서는 collection scan 으로 chunk 당 수 초 가능. Nginx/PHP-FPM 기본 60초는 넘지 않으나 운영자 대기 누적. 대형 hive 운영자 배포 전 `{driver_code, target_item_code, client_item_code}` 인덱스 생성 권고.
+- 프론트 HTTP 타임아웃이 발생해도 서버는 `finally` 까지 실행해 락을 정상 해제 → 다음 호출 정상 수용.
 - 느려지면 chunk size 를 200 등으로 조정 (상수 하나).
 
 ### E8. 매핑이 이미 삭제된 후 운영자가 동일 튜플로 정리
@@ -590,8 +661,10 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
 
 ### O-4. 10개 제한의 서버 검증
 - 현재 엔드포인트는 per-mapping (1건씩). 10 제한은 UX 가드.
-- 서버 보호는 `throttle:60,1` 미들웨어로 충당 (본 스펙에 포함됨, I-2 해결).
-- 악용·폭주 시나리오가 실측되면 client/user scope 로 별도 `RateLimiter::for(...)` 정의 고려.
+- 서버 보호는 `throttle:60,1` 미들웨어로 충당 (본 스펙에 포함, 1차 I-2 해결).
+- **악용 시나리오 수용 계산**: 사용자 1명당 분당 60 chunk = 분당 최대 30,000 문서 archive. MongoDB delete_many + insert_many 의 chunk 500 처리 비용을 고려할 때 운영상 허용 범위.
+- 같은 튜플 동시 호출은 분산 락으로, 서로 다른 튜플의 대량 병렬은 throttle 로 차단 — 두 층이 각자 목적.
+- 실측 악용 시 client/user scope 로 별도 `RateLimiter::for(...)` 정의 고려.
 
 ## 배포 및 릴리즈
 

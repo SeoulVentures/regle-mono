@@ -34,7 +34,7 @@
 
 - **MongoDB 토폴로지**: 단일 노드 / replica set 모두 대응. 트랜잭션 (multi-document) 을 의존하지 않는다 (C-1 해결로 불필요).
 - **`target_database_hive` 는 client 격리 DB**: 한 hive 내 `review_upload_target_list` 의 `{driver_code, target_item_code, client_item_code}` 조합은 해당 client 의 레코드로 고유하게 특정된다. 기존 `BaseUploadDriver.clean_failed_and_ready_by_review_target_item_map_id` (`review-moai-refactoring/app/drivers/BaseUploadDriver.py:745`) 가 동일 전제로 검증되어 운영 중. 본 스펙도 동일 전제 — `client_id` 필드 필터는 사용하지 않는다.
-- **Redis 캐시**: Laravel 의 기본 cache driver 가 Redis (또는 최소한 원자적 락을 지원하는 드라이버) 이어야 한다.
+- **Redis 캐시 (필수)**: Laravel cache driver 가 **원자적 락 + 프로세스 간 공유** (Redis/memcached) 여야 한다. `Cache::lock()` (C-2 방어) 과 `Cache::remember()` (서버 주도 `mapping_batch_id`) 둘 다 서버 간 일관성을 요구. `config/cache.php` 기본값이 `file` 인 환경은 이 스펙과 호환되지 않음 — 운영 배포 전 `CACHE_DRIVER=redis` 확인 필수.
 - **인덱스**: `review_upload_target_list_archive.{original_id: 1}` 유니크 인덱스를 생성한다. `review_upload_target_list` 의 필터 인덱스 `{driver_code, target_item_code, client_item_code}` 존재 여부는 운영 시점에 확인 (인덱스 부재 시 collection scan 이지만 hive 당 레코드 수가 제한적이라 일단 허용. 느릴 경우 추가).
 
 ## API
@@ -139,8 +139,13 @@ public function archive(Client $client, Request $request): JsonResponse
 {
     $validated = $request->validate([...]);
     // ... (a) Client 이미 바인딩, (b) DriverConfig 조회, (c) TargetItemMap 조회
-    $driverConfig = DriverConfig::findOrFail($validated['config_id']);
-    abort_if($driverConfig->client_id !== $client->id, 422, '드라이버 설정이 ...');
+    // find + null 체크 — findOrFail (404) 대신 422 로 통일. 설계 원칙 "config 접근 404 혼란 회피" 준수
+    $driverConfig = DriverConfig::find($validated['config_id']);
+    abort_if(
+        !$driverConfig || $driverConfig->client_id !== $client->id,
+        422,
+        '드라이버 설정이 해당 클라이언트에 속하지 않습니다.'
+    );
     $archivedMappingId = TargetItemMap::query()
         ->where('client_id', $client->id)
         ->where('config_id', $validated['config_id'])
@@ -638,10 +643,12 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
 - 대응: 운영 차원에서 주기적 export + 오래된 archive TTL 정리 (본 스펙 밖, O-2 로 이관)
 - 첫 호출이 `write error code 12` (exceeded quota) 등으로 실패하면 500 + Sentry. 운영자에게 DBA 확인 요청.
 
-### E10. Redis 락 캐시 미구성
-- `Cache::lock()` 이 array driver 에서는 프로세스별 분리라 실제 락 안 됨
-- 운영은 Redis 전제 (`config/cache.php` default=`redis`). 배포 전 확인.
-- 개발/테스트 환경에서는 락 획득 항상 성공 (실 운영 동시성과 다름) — 테스트 명시.
+### E10. Redis 캐시 미구성
+- `Cache::lock()` (C-2 방어) 과 `Cache::remember()` (서버 주도 `mapping_batch_id`) 둘 다 **Redis 전제**.
+- **array driver**: 프로세스별 분리 → 락 동작 안 됨, batch cache 가 요청마다 초기화
+- **file driver**: 서버 로컬 파일 기반 → 멀티 서버 간 공유 불가, 동일 서버 내 PHP-FPM 프로세스 간에는 공유되지만 Redis 대비 레이턴시·정합성 약화
+- 운영은 Redis 필수. `config/cache.php` 기본값이 `file` 이므로 `CACHE_DRIVER=redis` 환경변수 확인 배포 전 체크리스트.
+- 테스트 환경: `Cache::spy()` 또는 실제 Redis 컨테이너 사용. array driver 로는 batch_id 재사용 / 락 경합 검증 불가.
 
 ## 오픈 이슈
 
@@ -678,7 +685,7 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
 - [ ] MongoDB `review_upload_target_list_archive` 에 `{original_id: 1}` 유니크 인덱스 생성 (mongosh 또는 migration)
 - [ ] 엔드포인트 구현 (분산 락 + ordered:false insertMany + throttle 미들웨어)
 - [ ] 서비스 계층 단위 테스트 (chunk 경계, 메타 필드, BulkWriteException 11000 허용)
-- [ ] Feature 테스트 9 케이스 (정상/토큰/cross-client/삭제된 매핑/0건/재호출 멱등/락/throttle/delete 실패 복구)
+- [ ] Feature 테스트 9 케이스 (정상/토큰/cross-client/삭제된 매핑/0건 멱등/재호출 멱등+duplicate_count/mapping_batch_id 재사용/분산 락 423/throttle 429)
 - [ ] 프론트 확인 다이얼로그 + 진행 다이얼로그 (results 1-건 불변성 검증)
 - [ ] 취소 동작 검증 (4가지 경로: 시작 전/응답 후/sleep 중/에러 후 — 수동 QA)
 - [ ] 실제 curlyshyll 매핑 303315 로 스테이징 동작 확인 후 운영 배포

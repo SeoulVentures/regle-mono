@@ -26,8 +26,16 @@
 
 - **매핑 ID 비의존**: 엔드포인트는 `(client_id, config_id, target_item_code, client_item_code)` 튜플 기반. 매핑이 이미 삭제된 상태에서도 운영자가 동일 도구로 이관 이력을 정리할 수 있다.
 - **동기 처리**: 위험 동작이므로 백그라운드 큐 금지. 프론트가 사용자 대기 화면에서 순차 호출·진행률 표시.
-- **Chunked·멱등**: 매 호출은 독립적으로 500 건을 archive+delete. 세션 단절·사용자 취소·네트워크 실패 후 재실행해도 남은 레코드만 이어서 처리.
+- **Chunked·멱등**: 매 호출은 독립적으로 500 건을 archive+delete. 세션 단절·사용자 취소·네트워크 실패 후 재실행해도 남은 레코드만 이어서 처리. 멱등성은 **archive 측 유니크 인덱스 `{original_id: 1}`** + `ordered:false insertMany` 의 duplicate-key 허용으로 보장한다 (단순히 "유니크 인덱스 없음" 으로 넘기지 않는다).
+- **동시 실행 방지**: 같은 튜플에 대해 Laravel `Cache::lock()` (Redis 기반) 30초 TTL 분산 락을 획득한 후에만 처리. 획득 실패 시 423 Locked.
 - **Archive 는 이동이지 이력 테이블 아님**: 복원이 필요하면 운영자가 `review_upload_target_list_archive` 에서 `review_upload_target_list` 로 수동 이전. 자동 복원 UI 는 본 스펙 밖.
+
+## 전제 조건
+
+- **MongoDB 토폴로지**: 단일 노드 / replica set 모두 대응. 트랜잭션 (multi-document) 을 의존하지 않는다 (C-1 해결로 불필요).
+- **`target_database_hive` 는 client 격리 DB**: 한 hive 내 `review_upload_target_list` 의 `{driver_code, target_item_code, client_item_code}` 조합은 해당 client 의 레코드로 고유하게 특정된다. 기존 `BaseUploadDriver.clean_failed_and_ready_by_review_target_item_map_id` (`review-moai-refactoring/app/drivers/BaseUploadDriver.py:745`) 가 동일 전제로 검증되어 운영 중. 본 스펙도 동일 전제 — `client_id` 필드 필터는 사용하지 않는다.
+- **Redis 캐시**: Laravel 의 기본 cache driver 가 Redis (또는 최소한 원자적 락을 지원하는 드라이버) 이어야 한다.
+- **인덱스**: `review_upload_target_list_archive.{original_id: 1}` 유니크 인덱스를 생성한다. `review_upload_target_list` 의 필터 인덱스 `{driver_code, target_item_code, client_item_code}` 존재 여부는 운영 시점에 확인 (인덱스 부재 시 collection scan 이지만 hive 당 레코드 수가 제한적이라 일단 허용. 느릴 경우 추가).
 
 ## API
 
@@ -39,6 +47,7 @@ POST /api/review/clients/{client}/upload-history/archive
 
 - 매핑 독립 (클라이언트 단위 라우트)
 - 기존 `Route::prefix('review')->middleware('auth')->group(...)` 내부
+- 추가 미들웨어: `throttle:60,1` (사용자당 분당 60 호출 제한). 평균 10 매핑 × 20 chunk ≈ 200 회 요청을 3.3 분에 수용.
 
 ### Request
 
@@ -82,8 +91,10 @@ POST /api/review/clients/{client}/upload-history/archive
 - 토큰 불일치: 422 `{"message": "확인 문구가 일치하지 않습니다."}`
 - `config_id` 가 client 소속이 아님: 422 `{"message": "드라이버 설정이 해당 클라이언트에 속하지 않습니다."}`
 - `target_database_hive` / `driver_code` 결손: 422 `{"message": "클라이언트 또는 드라이버 설정이 불완전합니다."}`
+- 분산 락 획득 실패 (같은 튜플 동시 실행): 423 `{"message": "같은 매핑에 대한 아카이브 작업이 이미 진행 중입니다. 잠시 후 재시도하세요."}`
+- Rate limit 초과: 429 (Laravel throttle 기본 응답)
 - MongoDB 연결 실패: 500 (Handler 가 Sentry 전파)
-- insert 성공 후 delete 실패: 500 + `Log::error`. archive 에 중복 레코드 허용 (유니크 인덱스 없음). 재호출 시 안전하게 이어짐.
+- insert 성공 후 delete 실패: 500 + `Log::error`. 재호출 시 archive 유니크 인덱스가 이미 완료된 문서를 duplicate-key 로 차단 → 원본 `deleteMany` 가 재시도되어 안전하게 수렴.
 
 ## MongoDB 처리
 
@@ -101,59 +112,102 @@ state 무관 (ready / failed / finished 모두).
 
 ### 아카이브 흐름
 
+분산 락 → find → insertMany (duplicate key 허용) → deleteMany 순. 각 단계의 실패가 재호출 시 안전하게 수렴하도록 설계.
+
 ```php
 const CHUNK_SIZE = 500;
 
-// MongoDBConnection 서비스 재사용 (app/Services/MongoDB/MongoDBConnection.php)
-// CLAUDE.md: getClient() 사용 (deprecated getMongoClient() 대신), table() 사용 (deprecated collection() 대신)
-$conn = DB::connection('mongodb');
-$db = $conn->getClient()->selectDatabase($client->target_database_hive);
-$coll = $db->selectCollection('review_upload_target_list');
-$archiveColl = $db->selectCollection('review_upload_target_list_archive');
-
-$docs = $coll->find($filter, ['limit' => self::CHUNK_SIZE])->toArray();
-if (empty($docs)) {
-    return [
-        'archived_count' => 0,
-        'remaining_count' => 0,
-        'has_more' => false,
-        'batch_id' => $batchId,
-    ];
+// 1. 분산 락 획득 (C-2 방어) — 같은 튜플 동시 실행 차단
+$lockKey = sprintf(
+    'archive-upload-history:%d:%d:%s:%s',
+    $client->id, $configId, $targetItemCode, $clientItemCode
+);
+$lock = Cache::lock($lockKey, 30); // 30초 auto-release
+if (! $lock->get()) {
+    return response()->json([
+        'message' => '같은 매핑에 대한 아카이브 작업이 이미 진행 중입니다. 잠시 후 재시도하세요.',
+    ], 423);
 }
 
-$archivedAt = new UTCDateTime();
-$archivedBy = Auth::user()->email ?? 'unknown';
-$mappingId = TargetItemMap::query()
+try {
+    // 2. MongoDB 연결 — CLAUDE.md: getClient() / table() 사용
+    $conn = DB::connection('mongodb');
+    $db = $conn->getClient()->selectDatabase($client->target_database_hive);
+    $coll = $db->selectCollection('review_upload_target_list');
+    $archiveColl = $db->selectCollection('review_upload_target_list_archive');
+
+    // 3. 청크 조회
+    $docs = iterator_to_array($coll->find($filter, ['limit' => self::CHUNK_SIZE]));
+    if (empty($docs)) {
+        return ['archived_count' => 0, 'remaining_count' => 0, 'has_more' => false, 'batch_id' => $batchId];
+    }
+
+    // 4. 메타 추가 — archived_mapping_id 는 컨트롤러가 1회 조회 후 파라미터로 전달 (매 chunk 재조회 X)
+    $archivedAt = new UTCDateTime();
+    $originalIds = [];
+    foreach ($docs as &$doc) {
+        $originalIds[] = $doc['_id'];
+        $doc['original_id']         = $doc['_id'];
+        $doc['_id']                 = new ObjectId;
+        $doc['archived_at']         = $archivedAt;
+        $doc['archived_by']         = $archivedBy;
+        $doc['archived_mapping_id'] = $archivedMappingId; // param 으로 주입
+        $doc['archive_batch_id']    = $batchId;
+    }
+    unset($doc);
+
+    // 5. archive 에 insertMany — ordered:false + duplicate key (원본 완료분) 무시 (C-1 해결)
+    try {
+        $archiveColl->insertMany($docs, ['ordered' => false]);
+    } catch (BulkWriteException $e) {
+        // writeErrors 중 code 11000 (E11000 duplicate key) 외의 에러가 있으면 상위로 전파
+        foreach ($e->getWriteResult()->getWriteErrors() as $err) {
+            if ($err->getCode() !== 11000) {
+                throw $e;
+            }
+        }
+        // 모두 duplicate key → 이미 archive 된 원본이 재처리된 케이스. 정상 계속.
+    }
+
+    // 6. 원본 deleteMany — archive 성공 여부와 무관하게 같은 _id 들을 제거해 수렴
+    $coll->deleteMany(['_id' => ['$in' => $originalIds]]);
+
+    // 7. remaining_count — 필요 시 첫 호출만 집계 (최적화는 구현 단계 판단)
+    $remainingCount = $coll->countDocuments($filter);
+
+    return [
+        'archived_count' => count($docs),
+        'remaining_count' => $remainingCount,
+        'has_more' => $remainingCount > 0,
+        'batch_id' => $batchId,
+    ];
+} finally {
+    $lock->release();
+}
+```
+
+**컨트롤러 진입 시 1회 조회 (I-4 해결)**:
+
+```php
+$archivedMappingId = TargetItemMap::query()
     ->where('client_id', $client->id)
     ->where('config_id', $configId)
     ->where('target_item_code', $targetItemCode)
     ->where('client_item_code', $clientItemCode)
     ->value('id'); // nullable — 삭제된 매핑이면 null
-
-$originalIds = [];
-foreach ($docs as &$doc) {
-    $originalIds[] = $doc['_id'];
-    $doc['original_id']         = $doc['_id'];
-    $doc['_id']                 = new ObjectId;
-    $doc['archived_at']         = $archivedAt;
-    $doc['archived_by']         = $archivedBy;
-    $doc['archived_mapping_id'] = $mappingId;
-    $doc['archive_batch_id']    = $batchId;
-}
-unset($doc);
-
-$archiveColl->insertMany($docs);
-$coll->deleteMany(['_id' => ['$in' => $originalIds]]);
-
-$remainingCount = $coll->countDocuments($filter);
-
-return [
-    'archived_count' => count($docs),
-    'remaining_count' => $remainingCount,
-    'has_more' => $remainingCount > 0,
-    'batch_id' => $batchId,
-];
+// Service 호출에 $archivedMappingId 를 파라미터로 전달. 매 chunk MySQL 재조회 금지.
 ```
+
+**최초 배포 시 인덱스 생성**:
+
+```js
+// mongosh 또는 Laravel migration 내에서 1회 실행
+db.review_upload_target_list_archive.createIndex(
+    { original_id: 1 },
+    { unique: true, name: 'uniq_original_id' }
+);
+```
+- 컬렉션이 없으면 첫 호출 시 자동 생성되지만, 유니크 인덱스는 자동 생성되지 않으므로 **반드시 마이그레이션이나 부트스트랩 명령으로 보장**. 운영 MongoDB 에 배포 전 수동 실행해도 가능.
 
 ### 아카이브 도큐먼트 스키마
 
@@ -248,49 +302,96 @@ return [
 
 ### 프론트 실행 루프
 
+**불변성**: 각 매핑은 `results` 에 정확히 1건 push 된다 (완료 / 에러 / 취소 / 미처리 중 하나). `finally` 로 보장.
+
 ```ts
+type ArchiveResult =
+  | { mapping: TargetItemMap; status: 'completed'; archived: number }
+  | { mapping: TargetItemMap; status: 'error'; archived: number; message: string }
+  | { mapping: TargetItemMap; status: 'cancelled'; archived: number }
+  | { mapping: TargetItemMap; status: 'skipped' }  // 루프 시작 전 이미 취소됨
+
 const cancelled = ref(false)
 
 async function executeArchive(selected: TargetItemMap[]) {
   const results: ArchiveResult[] = []
 
   for (const [idx, m] of selected.entries()) {
-    if (cancelled.value) break
+    // 루프 시작 전 취소된 경우: skipped 로 기록
+    if (cancelled.value) {
+      results.push({ mapping: m, status: 'skipped' })
+      continue
+    }
 
     updateProgress({ currentMappingIndex: idx, mapping: m })
 
     let processed = 0
     let total: number | null = null
+    let finalStatus: ArchiveResult['status'] = 'cancelled'
+    let errorMessage: string | undefined
 
-    while (!cancelled.value) {
-      const res = await archiveUploadHistory(m.client_id, {
-        config_id: m.config_id,
-        target_item_code: m.target_item_code,
-        client_item_code: m.client_item_code,
-        confirm_text: '위험성을 알고 동의합니다',
-      })
+    try {
+      while (true) {
+        const res = await archiveUploadHistory(m.client_id, {
+          config_id: m.config_id,
+          target_item_code: m.target_item_code,
+          client_item_code: m.client_item_code,
+          confirm_text: '위험성을 알고 동의합니다',
+        })
 
-      if (!res.success) {
-        results.push({ mapping: m, error: res.message })
-        break
+        if (!res.success) {
+          finalStatus = 'error'
+          errorMessage = res.message
+          break
+        }
+
+        if (total === null) total = res.archived_count + res.remaining_count
+        processed += res.archived_count
+        updateProgress({ processed, total: Math.max(total, processed) })
+
+        if (!res.has_more) {
+          finalStatus = 'completed'
+          break
+        }
+
+        // 응답 반영 후 취소 확인 — 이 시점에 취소되면 현재 매핑은 부분 완료로 종료
+        if (cancelled.value) {
+          finalStatus = 'cancelled'
+          break
+        }
+
+        await sleep(300)
+
+        // sleep 이후에도 재확인 (sleep 중 취소된 경우)
+        if (cancelled.value) {
+          finalStatus = 'cancelled'
+          break
+        }
       }
-
-      if (total === null) total = res.archived_count + res.remaining_count
-      processed += res.archived_count
-      updateProgress({ processed, total })
-
-      if (!res.has_more) {
-        results.push({ mapping: m, archived: processed })
-        break
+    } finally {
+      // 어떤 경로로 루프를 빠져나오든 results 에 정확히 1건 push
+      if (finalStatus === 'error') {
+        results.push({ mapping: m, status: 'error', archived: processed, message: errorMessage! })
+      } else {
+        results.push({ mapping: m, status: finalStatus, archived: processed })
       }
-
-      await sleep(300)
     }
+
+    if (cancelled.value) break // 외부 for 루프는 한 번 더 돌면서 남은 매핑을 skipped 로 기록
   }
 
   showSummary(results, cancelled.value)
 }
 ```
+
+취소 경로별 기록:
+- 루프 시작 전 취소 → `skipped`, archived=0
+- chunk 응답 후 취소 → `cancelled`, archived=현재까지 처리량
+- sleep 중 취소 → `cancelled`, archived=현재까지 처리량
+- API 에러 → `error`, archived=현재까지 처리량 + 에러 메시지
+- 정상 완료 → `completed`, archived=총합
+
+요약 화면은 `N개 매핑 중 M개 완료, K개 취소 (부분 처리 포함), E개 에러` 처럼 상태별 집계 노출.
 
 ## 감사 로그
 
@@ -340,45 +441,65 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
   - cross-client config_id → 422
   - 매핑이 삭제된 상태 (mapping_id null) 에서도 archive 동작
   - 0건 요청 (has_more=false, archived_count=0) 멱등
-  - insert 성공 후 delete 실패 시뮬레이션 (archive 중복 허용)
+  - **재호출 멱등성**: 같은 원본을 두 번째 호출 시 archive 유니크 인덱스가 duplicate key 로 차단, 원본 deleteMany 만 실행됨
+  - **분산 락**: 같은 튜플에 락이 이미 걸려있으면 423 Locked (Cache::lock 을 mock 또는 실제 Redis 사용)
+  - **Rate limit**: 분당 60+1 호출 시 429 반환
 - `tests/Unit/Services/Review/UploadHistoryArchiveServiceTest.php`
   - chunk size 경계 (정확히 500, 501, 1000)
   - 아카이브 도큐먼트 메타 필드 검증
+  - `archived_mapping_id` 가 서비스 호출 1회당 MySQL 재조회 없이 파라미터로 전달되는지 검증
+  - `BulkWriteException` 중 code 11000 만 허용, 다른 에러는 전파됨을 검증
 
 ## 엣지 케이스
 
 ### E1. 동일 매핑을 두 운영자가 동시에 실행
-- 두 호출이 겹치면 MongoDB `find limit 500` 이 겹치는 문서를 읽을 수 있음
-- `insertMany` 는 새 `_id` 로 복사 → archive 에 중복 도큐먼트 생성 (유니크 인덱스 없어 허용됨)
-- `deleteMany` 는 `_id $in` 이라 중복 삭제 시도해도 영향 없음 (이미 삭제됨)
-- 결과: archive 에 동일 원본을 가리키는 중복 도큐먼트가 최대 N-1 개 남음. 드문 케이스라 무시.
+- **Cache::lock(튜플키, 30s)** 로 차단됨. 후발 호출은 423 Locked 응답.
+- 프론트는 423 수신 시 "다른 운영자가 처리 중" 토스트 노출 후 해당 매핑만 건너뛰고 다음 매핑으로 진행.
 
-### E2. 중간에 새 이관 레코드가 insert 됨
+### E2. Insert 성공 후 Delete 실패 → 재호출
+- archive 의 `{original_id: 1}` 유니크 인덱스가 같은 원본 재 insert 를 차단 (code 11000)
+- `ordered:false insertMany` 로 부분 성공 + 부분 duplicate key 모두 허용
+- duplicate key 만 있는 WriteError 는 정상 계속, `deleteMany($originalIds)` 로 원본 제거 재시도 → 수렴
+- archive 측 중복 누적 없음 (원본 1건당 archive 1건 보장)
+
+### E3. 중간에 새 이관 레코드가 insert 됨
 - 업로드 워커가 계속 돌면서 `review_upload_target_list` 에 새 레코드를 만듦
 - 프론트가 첫 호출 응답의 `total` 을 기반으로 진행률을 계산했으므로, 실제 처리량이 total 을 초과할 수 있음
-- 수용: 진행 바가 100% 를 살짝 넘거나 새로 증가. 사용자 혼란 최소화를 위해 progress clamp (`Math.min(processed, total)`) 적용, 필요 시 안내 문구 추가 여부는 구현 단계 판단.
+- 수용: progress clamp (`Math.max(total, processed)`) 적용. 사용자 혼란 최소화를 위해 안내 문구 추가 여부는 구현 단계 판단.
 
-### E3. target_database_hive 가 `null` 또는 공백
+### E4. target_database_hive 가 `null` 또는 공백
 - 검증에서 422 로 반환 (`클라이언트 설정이 불완전합니다`)
 - MongoDB 선택 직전 double-check
 
-### E4. 클라이언트는 있지만 MongoDB DB 자체가 존재하지 않음
+### E5. 클라이언트는 있지만 MongoDB DB 자체가 존재하지 않음
 - MongoDB 는 존재하지 않는 DB/컬렉션을 쿼리해도 에러가 아닌 빈 결과 반환
 - `archived_count=0, has_more=false` 응답. 멱등 성공 처리.
 
-### E5. 매우 큰 이관 이력 (예: 10만건)
+### E6. 매우 큰 이관 이력 (예: 10만건)
 - 10만 / 500 = 200 회 호출 × 300ms delay = 약 1분 + API 처리 시간
-- 사용자 UI 대기 시간 수분 단위 가능. 다이얼로그에 경고 문구 (예: "양이 많으면 수 분 걸릴 수 있습니다") 표시.
+- Rate limit (`throttle:60,1`) 에 의해 분당 60 호출 상한 → 200 회는 최소 3.3 분 분산
+- 사용자 UI 대기 시간 수 분 단위 가능. 다이얼로그에 경고 문구 (예: "양이 많으면 수 분 걸릴 수 있습니다") 표시.
 - 도중 취소 가능. 이어서 재실행 가능.
 
-### E6. HTTP 타임아웃
-- chunk 500 + countDocuments 1회 = 수백 ms 예상. 일반 타임아웃 내.
+### E7. HTTP 타임아웃
+- chunk 500 + countDocuments 1회 = 수백 ms 예상 (필터 인덱스 존재 시). 일반 타임아웃 내.
 - 느려지면 chunk size 를 200 등으로 조정 (상수 하나).
 
-### E7. 매핑이 이미 삭제된 후 운영자가 동일 튜플로 정리
+### E8. 매핑이 이미 삭제된 후 운영자가 동일 튜플로 정리
 - 엔드포인트는 매핑 존재 여부 검증하지 않음
 - `TargetItemMap` 레코드가 없으면 `archived_mapping_id = null` 로 기록
 - UI 에선 기본 노출 안 됨 (선택지 목록에 없으니), 운영자가 API 직접 호출 시나리오.
+
+### E9. Archive 컬렉션 디스크 풀
+- `review_upload_target_list_archive` 가 원본만큼 커질 수 있음
+- 기존 운영 hive 는 이미 리뷰 원본 데이터가 크기 때문에 누적 증가에 유의
+- 대응: 운영 차원에서 주기적 export + 오래된 archive TTL 정리 (본 스펙 밖, O-2 로 이관)
+- 첫 호출이 `write error code 12` (exceeded quota) 등으로 실패하면 500 + Sentry. 운영자에게 DBA 확인 요청.
+
+### E10. Redis 락 캐시 미구성
+- `Cache::lock()` 이 array driver 에서는 프로세스별 분리라 실제 락 안 됨
+- 운영은 Redis 전제 (`config/cache.php` default=`redis`). 배포 전 확인.
+- 개발/테스트 환경에서는 락 획득 항상 성공 (실 운영 동시성과 다름) — 테스트 명시.
 
 ## 오픈 이슈
 
@@ -397,9 +518,9 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
 - 반복 수요가 생기면 UI 추가
 
 ### O-4. 10개 제한의 서버 검증
-- 현재 엔드포인트는 per-mapping (1건씩) 이므로 10 제한은 UX 가드 뿐
-- 악의적 사용자 차단 목적이 아니라 실수 방지 목적 — 엔드포인트 자체에 rate limit 은 불필요
-- 필요 시 Laravel `throttle` 미들웨어로 분당 호출 수 제한 고려 (본 스펙 밖)
+- 현재 엔드포인트는 per-mapping (1건씩). 10 제한은 UX 가드.
+- 서버 보호는 `throttle:60,1` 미들웨어로 충당 (본 스펙에 포함됨, I-2 해결).
+- 악용·폭주 시나리오가 실측되면 client/user scope 로 별도 `RateLimiter::for(...)` 정의 고려.
 
 ## 배포 및 릴리즈
 
@@ -410,10 +531,11 @@ MongoDB archive 레코드 자체가 1차 감사 소스 (원본 + 메타 보존).
 
 ## 완료 기준
 
-- [ ] 엔드포인트 구현 + 검증 + 예외 처리
-- [ ] 서비스 계층 단위 테스트 (chunk 경계, 메타 필드)
-- [ ] Feature 테스트 6 케이스 (정상/토큰/cross-client/삭제된 매핑/0건 멱등/delete 실패)
-- [ ] 프론트 확인 다이얼로그 + 진행 다이얼로그
-- [ ] 취소 동작 검증 (수동 QA)
+- [ ] MongoDB `review_upload_target_list_archive` 에 `{original_id: 1}` 유니크 인덱스 생성 (mongosh 또는 migration)
+- [ ] 엔드포인트 구현 (분산 락 + ordered:false insertMany + throttle 미들웨어)
+- [ ] 서비스 계층 단위 테스트 (chunk 경계, 메타 필드, BulkWriteException 11000 허용)
+- [ ] Feature 테스트 9 케이스 (정상/토큰/cross-client/삭제된 매핑/0건/재호출 멱등/락/throttle/delete 실패 복구)
+- [ ] 프론트 확인 다이얼로그 + 진행 다이얼로그 (results 1-건 불변성 검증)
+- [ ] 취소 동작 검증 (4가지 경로: 시작 전/응답 후/sleep 중/에러 후 — 수동 QA)
 - [ ] 실제 curlyshyll 매핑 303315 로 스테이징 동작 확인 후 운영 배포
 - [ ] 배포 후 운영자가 대기 중인 요청 처리

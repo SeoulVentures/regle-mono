@@ -15,8 +15,16 @@ data "aws_s3_object" "monitoring_env" {
 }
 
 locals {
-  # .env 형식의 SLACK_WEBHOOK_URL 라인만 추출. URL 안에는 = 없음 (Slack 표준).
-  slack_webhook_url = regex("(?m)^SLACK_WEBHOOK_URL=(.+)$", data.aws_s3_object.monitoring_env.body)[0]
+  # .env 형식의 SLACK_WEBHOOK_URL 라인 추출. CRLF (\r 잔존) / 따옴표 (`"..."`)
+  # / trailing whitespace / leading whitespace / inline comment 모두 처리.
+  # trimspace 로 \r 또는 trailing space 가 invocation_endpoint 에 섞이는 경우
+  # Slack 호출이 silent 실패하는 위험 회피 (#192 codex review).
+  slack_webhook_url = trimspace(
+    regex(
+      "(?m)^\\s*SLACK_WEBHOOK_URL\\s*=\\s*\"?([^\"\\r\\n#]+)\"?\\s*$",
+      data.aws_s3_object.monitoring_env.body,
+    )[0]
+  )
 }
 
 # -----------------------------------------------------------------------------
